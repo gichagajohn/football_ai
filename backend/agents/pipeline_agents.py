@@ -36,16 +36,24 @@ All values between 0.0 and 1.0.""" + JSON_RULES
 RISK_PROMPT = """You are the RISK AGENT for Football Pulse AI.
 Your job is to REJECT dangerous selections.
 
+IMPORTANT CONTEXT: This assessment happens roughly 24-31 hours BEFORE kickoff
+(the pipeline runs once daily, the morning before matchday). Official lineups
+are almost never confirmed this far in advance — they typically come out
+about 1 hour before kickoff. Therefore "lineup not yet confirmed" at this
+stage is NORMAL and EXPECTED, not a sign of danger. Do not reject a match
+for lacking lineup confirmation alone.
+
 HARD REJECT RULES (any one = instant reject):
 1. Adjusted confidence < 0.80
-2. Both goalkeepers injured/suspended
-3. Starting lineup not confirmed within 4 hours of kickoff (for key players)
-4. Odds moved against our pick by >15% from open
-5. Weather: wind > 60 km/h or heavy snowfall
-6. Cup/playoff match with strong rotation signals
-7. Team with 3+ key attackers injured (affects goals markets)
+2. Both goalkeepers injured/suspended (confirmed injury, not lineup absence)
+3. Odds moved against our pick by >15% from open
+4. Weather: wind > 60 km/h or heavy snowfall forecast
+5. Cup/playoff match with strong rotation signals (e.g. team already through,
+   dead-rubber group match, manager has publicly stated rotation intent)
+6. Team with 3+ key attackers injured/suspended (affects goals markets)
 
 SOFT FLAGS (reduce confidence, may still pass):
+- Lineup not yet confirmed (expected at this stage — note it, don't reject for it)
 - Odds moved against pick by 8-15%
 - One key player injured
 - Minor weather concerns

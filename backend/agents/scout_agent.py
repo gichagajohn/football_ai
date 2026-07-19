@@ -2,9 +2,13 @@
 SCOUT AGENT — Football Pulse AI (GitHub Actions edition)
 Pulls fixtures, odds, form, injuries, lineups, weather, travel, market movement.
 
-Filters to top European leagues for better data quality/completeness,
-and increases the per-day match cap since GitHub Actions runs once daily
-(no repeated manual testing burning through quota).
+Filters to top European leagues for better data quality/completeness.
+
+Uses a two-pass strategy: a cheap odds-only pre-scan across ALL fixtures
+found (to prioritize which ones are likely to yield complete data), then
+full deep analysis (odds+injuries+weather+LLM) on the best batch first —
+automatically pulling in more matches if too few pass the quality bar,
+rather than being stuck with whatever the API happened to return first.
 """
 
 import asyncio
@@ -31,15 +35,25 @@ TOP_LEAGUE_IDS = {
     2: "UEFA Champions League",
 }
 
-# Max matches processed per day. Each match = 1 odds call + 2 injury calls
-# (3 API-Football calls) + 1 Groq call for Scout analysis. At 15 matches:
-# ~46 API-Football calls (well under 100/day free tier) and ~15 Groq calls
-# for Scout alone (leaving budget for Analyst/Risk/Portfolio/Auditor/Decision/
-# Publisher on the matches that make it through the Cleaner).
-MAX_MATCHES_PER_DAY = 15
+# Size of the FIRST analysis batch. Each fully-analyzed match costs:
+# 1 injury pair + 1 weather call (API-Football/OpenWeather) + 1 Groq call
+# for Scout structuring. Kept at 12 (not equal to HARD_CAP_MATCHES) so the
+# fallback batch below actually has room to run if needed.
+MAX_MATCHES_PER_DAY = 12
+
+# Size of each FALLBACK batch, pulled in only if the first batch didn't
+# yield enough qualifying matches. Smaller than the first batch to keep
+# total token usage predictable.
+FALLBACK_BATCH_SIZE = 6
 
 SYSTEM_PROMPT = """You are the SCOUT AGENT for Football Pulse AI.
 Your job is to gather and structure football match intelligence.
+
+IMPORTANT TIMING CONTEXT: You are analyzing matches roughly 24-31 hours
+before kickoff (this runs once daily, the morning before matchday).
+Official lineups are almost NEVER confirmed this far ahead — they
+typically post about 1 hour before kickoff. An unconfirmed lineup at
+this stage is NORMAL, not a data quality problem.
 
 Given raw data from APIs and web sources, you:
 1. Extract the most relevant fixtures for today + next 24h
@@ -47,13 +61,16 @@ Given raw data from APIs and web sources, you:
 3. Flag meaningful odds movements (>10% from open)
 4. Note travel distances >500km for away teams
 5. Assess weather risk (heavy rain, wind >50km/h, extreme cold)
-6. Detect lineup uncertainty (less than 6h before kickoff with no official lineup)
+6. Note lineup status as informational only (expected to be unconfirmed
+   at this stage — this is not itself a red flag)
 
 IMPORTANT OUTPUT RULES:
 - Respond with ONLY the JSON object. No markdown code fences, no commentary, no explanation before or after.
 - data_completeness must be a float between 0.0 and 1.0 reflecting how much real data you actually received
-  (odds present, injuries present, weather present, lineups confirmed). If most fields are missing/UNKNOWN,
-  data_completeness should be LOW (e.g. 0.3-0.5), not artificially high.
+  (team names, odds present, injury reports present, weather present). Do NOT penalize completeness for
+  lineups being unconfirmed — that's expected at this stage, not missing data. If odds/injuries/weather
+  are genuinely missing/UNKNOWN, data_completeness should be LOW (e.g. 0.3-0.5); lineup status has no
+  bearing on this score.
 - Never hallucinate injury or lineup data — if unknown, state 'UNKNOWN'."""
 
 
@@ -221,8 +238,134 @@ Return a JSON object with this structure (and nothing else):
     return result
 
 
+async def quick_odds_check(fixture_id: int) -> dict:
+    """
+    Cheap pre-scan: fetches odds once and returns them directly, so the
+    deep-analysis pass can reuse this result instead of fetching odds
+    again. Returns {} if no odds are posted yet for this fixture.
+    """
+    async with httpx.AsyncClient(timeout=10) as http:
+        try:
+            resp = await http.get(
+                "https://v3.football.api-sports.io/odds",
+                headers={"x-apisports-key": os.environ.get("API_FOOTBALL_KEY", "")},
+                params={"fixture": fixture_id, "bookmaker": 6},
+            )
+            resp.raise_for_status()
+            odds_data = resp.json().get("response", [])
+            return odds_data[0] if odds_data else {}
+        except Exception:
+            return {}
+
+
+# Minimum matches that must reach a usable completeness score before Scout
+# stops pulling in more candidates. Mirrors the Cleaner's own bar (see
+# pipeline.py CLEANER_THRESHOLD) so Scout doesn't stop short of what the
+# Cleaner would have accepted anyway.
+MIN_QUALIFYING_MATCHES = 2
+QUALIFYING_COMPLETENESS = 0.5
+
+# Absolute ceiling on how many matches Scout will ever fully analyze in one
+# run (first batch + fallback batch combined). MUST be greater than
+# MAX_MATCHES_PER_DAY or the fallback can never actually trigger — see
+# budget note in run() for why 18 is the safe ceiling given Groq's
+# 100,000 tokens/day free limit.
+HARD_CAP_MATCHES = 18
+
+# Cap on how many fixtures get the cheap odds pre-scan. On a huge day
+# (50-60+ fixtures across all top leagues) scanning literally all of them
+# would itself burn most of the daily API-Football budget before deep
+# analysis even starts.
+PRESCAN_CAP = 30
+
+
+async def _deep_analyze(fixture: dict, prefetched_odds: dict) -> dict:
+    """
+    Run the full injuries+weather+LLM analysis for one fixture. Odds are
+    passed in from the pre-scan pass (quick_odds_check) rather than
+    re-fetched here, to avoid burning a second API-Football call per match.
+    """
+    fixture_id = fixture["fixture"]["id"]
+    home_id = fixture["teams"]["home"]["id"]
+    away_id = fixture["teams"]["away"]["id"]
+    venue_city = fixture["fixture"].get("venue", {}).get("city") or None
+
+    odds = prefetched_odds
+    home_injuries, away_injuries, weather = await asyncio.gather(
+        fetch_injuries(home_id),
+        fetch_injuries(away_id),
+        fetch_weather(venue_city),
+    )
+
+    raw = {
+        "fixture": fixture,
+        "odds": odds,
+        "home_injuries": home_injuries,
+        "away_injuries": away_injuries,
+        "weather": weather,
+    }
+
+    structured = analyze_with_groq(raw)
+
+    # Fallback completeness score, odds weighted lower (often post late)
+    if "data_completeness" not in structured or structured.get("data_completeness") is None:
+        score = 0.0
+        if structured.get("home_team") and structured.get("away_team"):
+            score += 0.4
+        if home_injuries or away_injuries:
+            score += 0.3
+        if odds:
+            score += 0.2
+        if weather.get("temp_c") is not None:
+            score += 0.1
+        structured["data_completeness"] = round(score, 2)
+
+    structured.setdefault("fixture_id", fixture_id)
+    if not structured.get("odds_snapshot") and odds:
+        structured["odds_snapshot"] = _extract_odds_snapshot(odds)
+
+    logger.info(
+        f"[SCOUT] ✓ {structured.get('home_team', '?')} vs {structured.get('away_team', '?')} "
+        f"({structured.get('league', '?')}) — completeness={structured.get('data_completeness')}"
+    )
+    return structured
+
+
 async def run(target_date: date | None = None) -> list[dict]:
-    """Main scout agent entrypoint. Returns list of structured match intelligence."""
+    """
+    Main scout agent entrypoint. Returns list of structured match intelligence.
+
+    Two-pass strategy:
+      1. Cheap pre-scan: fetch odds for up to PRESCAN_CAP fixtures found
+         (no injuries/weather/LLM calls yet). Fixtures WITH odds are
+         prioritized, since they're far more likely to yield a complete
+         analysis. Odds are cached here and reused in pass 2 — never
+         fetched twice for the same fixture.
+      2. Full deep analysis (injuries+weather+LLM, reusing pre-scanned
+         odds) runs on the best-prioritized batch of MAX_MATCHES_PER_DAY
+         first. If fewer than MIN_QUALIFYING_MATCHES end up with usable
+         completeness, automatically pulls in ONE additional fallback
+         batch of FALLBACK_BATCH_SIZE from the remaining pool — up to
+         HARD_CAP_MATCHES total — rather than silently giving up.
+
+    Budget check (worst case, both batches fully used = HARD_CAP_MATCHES=18):
+      API-Football (free tier: 100 calls/day):
+        - 6 calls: fixture list, one per top league
+        - up to 30 calls: pre-scan (PRESCAN_CAP), odds only
+        - up to 36 calls: deep analysis (18 matches x 2 injury calls;
+          odds reused from pre-scan, not re-fetched)
+        Total: 6 + 30 + 36 = 72 calls — safely under 100.
+      Groq (free tier: 100,000 tokens/day):
+        - ~2,000 tokens/match for Scout structuring x 18 = ~36,000
+        - ~1,350 tokens/match for Analyst x 18 = ~24,300
+        - ~1,050 tokens/match for Risk x 18 = ~18,900
+        - ~8,650 tokens flat for Portfolio+Auditor+Decision+Publisher
+        Total: ~87,850 tokens — under 100,000, but with less margin.
+        NOTE: this is the budget for ONE scheduled daily run. Manually
+        re-triggering the workflow multiple times on the same day (e.g.
+        for testing) can still exhaust the daily Groq quota — this was
+        observed during development testing, not a bug in the logic.
+    """
     target_date = target_date or date.today() + timedelta(days=1)
     logger.info(f"[SCOUT] Collecting intelligence for {target_date} (top-5 leagues + UCL)")
 
@@ -231,59 +374,76 @@ async def run(target_date: date | None = None) -> list[dict]:
         logger.warning("[SCOUT] No fixtures found in top leagues for this date.")
         return []
 
-    logger.info(f"[SCOUT] {len(fixtures)} total fixtures found across top leagues, processing up to {MAX_MATCHES_PER_DAY}.")
-
-    results = []
-    for fixture in fixtures[:MAX_MATCHES_PER_DAY]:
-        fixture_id = fixture["fixture"]["id"]
-        home_id = fixture["teams"]["home"]["id"]
-        away_id = fixture["teams"]["away"]["id"]
-        venue_city = fixture["fixture"].get("venue", {}).get("city") or None
-
-        odds, home_injuries, away_injuries, weather = await asyncio.gather(
-            fetch_odds(fixture_id),
-            fetch_injuries(home_id),
-            fetch_injuries(away_id),
-            fetch_weather(venue_city),
-        )
-
-        raw = {
-            "fixture": fixture,
-            "odds": odds,
-            "home_injuries": home_injuries,
-            "away_injuries": away_injuries,
-            "weather": weather,
-        }
-
-        structured = analyze_with_groq(raw)
-
-        # Fallback completeness score, odds weighted lower (often post late)
-        if "data_completeness" not in structured or structured.get("data_completeness") is None:
-            score = 0.0
-            if structured.get("home_team") and structured.get("away_team"):
-                score += 0.4
-            if home_injuries or away_injuries:
-                score += 0.3
-            if odds:
-                score += 0.2
-            if weather.get("temp_c") is not None:
-                score += 0.1
-            structured["data_completeness"] = round(score, 2)
-
-        structured.setdefault("fixture_id", fixture_id)
-        # Carry forward raw odds_snapshot fallback in case LLM omitted it
-        if not structured.get("odds_snapshot") and odds:
-            structured["odds_snapshot"] = _extract_odds_snapshot(odds)
-
-        results.append(structured)
+    prescan_pool = fixtures[:PRESCAN_CAP]
+    if len(fixtures) > PRESCAN_CAP:
         logger.info(
-            f"[SCOUT] ✓ {structured.get('home_team', '?')} vs {structured.get('away_team', '?')} "
-            f"({structured.get('league', '?')}) — completeness={structured.get('data_completeness')}"
+            f"[SCOUT] {len(fixtures)} fixtures found — capping pre-scan to first "
+            f"{PRESCAN_CAP} to stay within API budget."
         )
 
-        await asyncio.sleep(1)  # ease rate limits
+    logger.info(f"[SCOUT] Running quick odds pre-scan on {len(prescan_pool)} fixture(s)...")
 
-    logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages.")
+    # ── Pass 1: cheap odds pre-scan (cached for reuse in pass 2) ────
+    odds_cache: dict[int, dict] = {}
+    scanned = []
+    for fixture in prescan_pool:
+        fixture_id = fixture["fixture"]["id"]
+        odds = await quick_odds_check(fixture_id)
+        odds_cache[fixture_id] = odds
+        scanned.append((fixture, bool(odds)))
+        await asyncio.sleep(0.3)  # light throttle, this is a cheap call
+
+    with_odds = [f for f, has_odds in scanned if has_odds]
+    without_odds = [f for f, has_odds in scanned if not has_odds]
+    prioritized = with_odds + without_odds  # odds-available fixtures go first
+
+    logger.info(
+        f"[SCOUT] Pre-scan complete: {len(with_odds)}/{len(scanned)} fixtures have odds posted. "
+        f"Prioritizing those first."
+    )
+
+    # ── Pass 2: full deep analysis — first batch, then fallback if needed ──
+    results: list[dict] = []
+    cursor = 0
+    is_first_batch = True
+
+    while cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
+        batch_size = MAX_MATCHES_PER_DAY if is_first_batch else FALLBACK_BATCH_SIZE
+        remaining_budget = HARD_CAP_MATCHES - len(results)
+        batch_size = min(batch_size, remaining_budget)
+
+        batch = prioritized[cursor:cursor + batch_size]
+        cursor += batch_size
+        is_first_batch = False
+
+        logger.info(f"[SCOUT] Analyzing batch of {len(batch)} fixture(s) (processed so far: {len(results)})...")
+
+        for fixture in batch:
+            fixture_id = fixture["fixture"]["id"]
+            prefetched_odds = odds_cache.get(fixture_id, {})
+            structured = await _deep_analyze(fixture, prefetched_odds)
+            results.append(structured)
+            await asyncio.sleep(1)  # ease rate limits on injuries/weather/Groq
+
+        qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
+        logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
+
+        if qualifying >= MIN_QUALIFYING_MATCHES:
+            logger.info("[SCOUT] Enough qualifying matches found — stopping further batches.")
+            break
+
+        if cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
+            logger.info(
+                f"[SCOUT] Only {qualifying} qualifying match(es) so far (need {MIN_QUALIFYING_MATCHES}). "
+                f"Pulling one fallback batch automatically..."
+            )
+        else:
+            logger.info(
+                f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget "
+                f"remaining to pull further batches."
+            )
+
+    logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages total.")
     return results
 
 
