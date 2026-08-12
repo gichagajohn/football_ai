@@ -5,6 +5,7 @@ final published ticket as a string (for emailing).
 """
 
 import logging
+import os
 from datetime import date
 
 from backend.agents.scout_agent import run as run_scout
@@ -25,7 +26,10 @@ logging.basicConfig(
 logger = logging.getLogger("football_pulse")
 
 # Minimum data_completeness for a match to pass the Cleaner.
-CLEANER_THRESHOLD = 0.5
+# Overridable via CLEANER_THRESHOLD env var for testing (e.g. lowering it
+# temporarily while also testing with a broader LEAGUE_IDS override in
+# scout_agent.py). Leave unset for normal runs — defaults to 0.5.
+CLEANER_THRESHOLD = float(os.environ.get("CLEANER_THRESHOLD", "0.5"))
 
 
 async def run_pipeline(target_date: date | None = None) -> str:
