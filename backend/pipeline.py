@@ -5,7 +5,7 @@ final published ticket as a string (for emailing).
 """
 
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 from backend.agents.scout_agent import run as run_scout
 from backend.agents.pipeline_agents import (
@@ -30,7 +30,7 @@ CLEANER_THRESHOLD = 0.5
 
 async def run_pipeline(target_date: date | None = None) -> str:
     """Full pipeline run. Returns the final published ticket as a string."""
-    target_date = target_date or date.today() + timedelta(days=1)
+    target_date = target_date or date.today()
     date_str = target_date.strftime("%A, %d %B %Y")
     logger.info("=" * 60)
     logger.info("  FOOTBALL PULSE AI — Pipeline Start")
