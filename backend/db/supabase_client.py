@@ -35,7 +35,9 @@ Schema (create this table in Supabase SQL editor first):
         market text,
         odds numeric,
         rationale text,
-        outcome text default 'pending'            -- pending | win | loss | void
+        outcome text default 'pending',           -- pending | win | loss | void
+        home_score smallint,                       -- added for Results page (Phase 2)
+        away_score smallint                         -- added for Results page (Phase 2)
     );
 """
 
@@ -139,7 +141,6 @@ def get_pending_tickets(before_date: date) -> list[dict]:
     """Fetch published tickets with pending outcomes, dated before before_date."""
     if not _enabled():
         return []
-
     try:
         resp = httpx.get(
             f"{SUPABASE_URL}/rest/v1/prediction_tickets",
@@ -163,7 +164,6 @@ def get_selections_for_date(ticket_date: date) -> list[dict]:
     """Fetch all selections for a given ticket date."""
     if not _enabled():
         return []
-
     try:
         resp = httpx.get(
             f"{SUPABASE_URL}/rest/v1/ticket_selections",
@@ -181,17 +181,30 @@ def get_selections_for_date(ticket_date: date) -> list[dict]:
         return []
 
 
-def update_selection_outcome(selection_id: int, outcome: str) -> None:
-    """Update a single selection's outcome (win/loss/void)."""
+def update_selection_outcome(
+    selection_id: int,
+    outcome: str,
+    home_score: int | None = None,
+    away_score: int | None = None,
+) -> None:
+    """
+    Update a single selection's outcome (win/loss/void) and, if known,
+    the final match score. home_score/away_score are optional so this
+    function still works for callers that only have the outcome.
+    """
     if not _enabled():
         return
-
+    payload = {"outcome": outcome}
+    if home_score is not None:
+        payload["home_score"] = home_score
+    if away_score is not None:
+        payload["away_score"] = away_score
     try:
         resp = httpx.patch(
             f"{SUPABASE_URL}/rest/v1/ticket_selections",
             headers=HEADERS,
             params={"id": f"eq.{selection_id}"},
-            json={"outcome": outcome},
+            json=payload,
             timeout=15,
         )
         resp.raise_for_status()
@@ -203,7 +216,6 @@ def update_ticket_outcome(ticket_date: date, outcome: str) -> None:
     """Update a ticket's overall outcome (win = all selections won, loss = at least one lost)."""
     if not _enabled():
         return
-
     try:
         resp = httpx.patch(
             f"{SUPABASE_URL}/rest/v1/prediction_tickets",
@@ -222,7 +234,6 @@ def get_recent_tickets(limit: int = 30) -> list[dict]:
     """Fetch the most recent tickets, ordered by date descending."""
     if not _enabled():
         return []
-
     try:
         resp = httpx.get(
             f"{SUPABASE_URL}/rest/v1/prediction_tickets",
