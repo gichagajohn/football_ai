@@ -95,6 +95,12 @@ def store_ticket(
         resp = httpx.post(
             f"{SUPABASE_URL}/rest/v1/prediction_tickets",
             headers=HEADERS,
+            # "Prefer: resolution=merge-duplicates" alone isn't enough — PostgREST
+            # needs to be told which unique column to treat as the conflict target.
+            # Without this, it falls back to the primary key (id), which is never
+            # present in ticket_row, so it silently attempts a plain INSERT and
+            # then 409s against the ticket_date unique constraint on any re-run.
+            params={"on_conflict": "ticket_date"},
             json=ticket_row,
             timeout=15,
         )
