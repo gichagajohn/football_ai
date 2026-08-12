@@ -25,11 +25,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("football_pulse")
 
+
+def _float_env(name: str, default: float) -> float:
+    """
+    Reads a float-valued env var safely. Treats both "unset" AND
+    "set but empty string" (e.g. a workflow env: block with a blank
+    value, or an unpopulated repo variable/secret) as "use the default"
+    instead of crashing with ValueError: could not convert string to
+    float: ''. Also guards against a non-numeric value being pasted in
+    by mistake — logs a warning and falls back rather than crashing the
+    whole pipeline over one bad env var.
+    """
+    raw = os.environ.get(name, "")
+    raw = raw.strip() if raw else ""
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Env var {name}='{raw}' is not a valid float — using default {default}.")
+        return default
+
+
 # Minimum data_completeness for a match to pass the Cleaner.
 # Overridable via CLEANER_THRESHOLD env var for testing (e.g. lowering it
 # temporarily while also testing with a broader LEAGUE_IDS override in
 # scout_agent.py). Leave unset for normal runs — defaults to 0.5.
-CLEANER_THRESHOLD = float(os.environ.get("CLEANER_THRESHOLD", "0.5"))
+CLEANER_THRESHOLD = _float_env("CLEANER_THRESHOLD", 0.5)
 
 
 async def run_pipeline(target_date: date | None = None) -> str:
