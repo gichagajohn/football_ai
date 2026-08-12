@@ -1,17 +1,14 @@
 """
 DAILY RUN — Football Pulse AI (GitHub Actions edition)
-
 This is the entrypoint script run by the GitHub Actions daily workflow.
 It:
   1. Checks outcomes of past published tickets (Memory Agent input)
-  2. Runs the full prediction pipeline for tomorrow
+  2. Runs the full prediction pipeline for today
   3. Emails the resulting ticket
 """
-
 import asyncio
 import logging
 from datetime import date
-
 from backend.pipeline import run_pipeline
 from backend.email_sender import send_email
 from backend import result_checker
@@ -35,10 +32,9 @@ async def main():
 
     # ── Step 2: Run the prediction pipeline ─────────────────────
     logger.info("Running prediction pipeline...")
-    ticket = await run_pipeline()
+    ticket = await run_pipeline(target_date=today)
 
     # ── Step 3: Email the ticket ────────────────────────────────
-    tomorrow = today  # run_pipeline defaults to date.today() + 1 day internally
     subject = f"⚽ Football Pulse AI — Daily Ticket ({today.isoformat()})"
     send_email(subject, ticket)
 
