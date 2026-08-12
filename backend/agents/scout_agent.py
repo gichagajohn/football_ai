@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from datetime import date, timedelta
+from datetime import date
 
 import httpx
 from groq import Groq
@@ -26,7 +26,9 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # API-Football league IDs for the top 5 European leagues + Champions League.
 # https://www.api-football.com/documentation-v3#tag/Leagues
-TOP_LEAGUE_IDS = {
+# This is the DEFAULT set used whenever LEAGUE_IDS is not set in the
+# environment — i.e. normal daily production runs.
+DEFAULT_LEAGUE_IDS = {
     39: "Premier League",
     140: "La Liga",
     78: "Bundesliga",
@@ -34,6 +36,66 @@ TOP_LEAGUE_IDS = {
     61: "Ligue 1",
     2: "UEFA Champions League",
 }
+
+# Friendly names for other common API-Football league IDs, used only for
+# nicer log output when testing with a LEAGUE_IDS override below. Not
+# exhaustive — any ID not listed here just logs as "League <id>", which is
+# harmless, it's purely cosmetic.
+KNOWN_LEAGUE_NAMES = {
+    **DEFAULT_LEAGUE_IDS,
+    3: "UEFA Europa League",
+    848: "UEFA Europa Conference League",
+    88: "Eredivisie",
+    94: "Primeira Liga",
+    203: "Süper Lig",
+    144: "Belgian Pro League",
+    40: "Championship (England)",
+    253: "MLS",
+    71: "Brasileirão",
+    128: "Liga Profesional (Argentina)",
+}
+
+
+def _load_league_ids() -> dict[int, str]:
+    """
+    Reads the LEAGUE_IDS env var (comma-separated API-Football league IDs,
+    e.g. "39,140,88,203") if set, otherwise falls back to the normal
+    top-5 + UCL default. This is meant for one-off testing runs — e.g.
+    to confirm the pipeline works end-to-end on a day when top-5+UCL
+    happens to have no fixtures — without editing this file back and
+    forth. For normal daily runs, just leave LEAGUE_IDS unset.
+    """
+    override = os.environ.get("LEAGUE_IDS", "").strip()
+    if not override:
+        return DEFAULT_LEAGUE_IDS
+
+    ids: list[int] = []
+    for part in override.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            logger.warning(f"[SCOUT] Ignoring invalid league id in LEAGUE_IDS: '{part}'")
+
+    if not ids:
+        logger.warning("[SCOUT] LEAGUE_IDS was set but contained no valid ids — falling back to default top-5+UCL.")
+        return DEFAULT_LEAGUE_IDS
+
+    result = {i: KNOWN_LEAGUE_NAMES.get(i, f"League {i}") for i in ids}
+    logger.info(f"[SCOUT] LEAGUE_IDS override active — using {len(result)} league(s): {list(result.values())}")
+    return result
+
+
+TOP_LEAGUE_IDS = _load_league_ids()
+
+# Minimum data_completeness for a match to count as "qualifying" during
+# Scout's own batch-sizing decisions (see MIN_QUALIFYING_MATCHES below).
+# Overridable via CLEANER_THRESHOLD so a testing run that loosens the
+# Cleaner's bar (in pipeline.py) doesn't leave Scout still pulling extra
+# fallback batches against the old, stricter default.
+CLEANER_THRESHOLD_ENV = float(os.environ.get("CLEANER_THRESHOLD", "0.5"))
 
 # Size of the FIRST analysis batch. Each fully-analyzed match costs:
 # 1 injury pair + 1 weather call (API-Football/OpenWeather) + 1 Groq call
@@ -260,10 +322,12 @@ async def quick_odds_check(fixture_id: int) -> dict:
 
 # Minimum matches that must reach a usable completeness score before Scout
 # stops pulling in more candidates. Mirrors the Cleaner's own bar (see
-# pipeline.py CLEANER_THRESHOLD) so Scout doesn't stop short of what the
-# Cleaner would have accepted anyway.
+# pipeline.py CLEANER_THRESHOLD) — both now read from the same
+# CLEANER_THRESHOLD env var (default 0.5), so Scout never stops short of
+# what the Cleaner would have accepted anyway, even during a testing run
+# that loosens the threshold.
 MIN_QUALIFYING_MATCHES = 2
-QUALIFYING_COMPLETENESS = 0.5
+QUALIFYING_COMPLETENESS = CLEANER_THRESHOLD_ENV
 
 # Absolute ceiling on how many matches Scout will ever fully analyze in one
 # run (first batch + fallback batch combined). MUST be greater than
@@ -366,12 +430,13 @@ async def run(target_date: date | None = None) -> list[dict]:
         for testing) can still exhaust the daily Groq quota — this was
         observed during development testing, not a bug in the logic.
     """
-    target_date = target_date or date.today() + timedelta(days=1)
-    logger.info(f"[SCOUT] Collecting intelligence for {target_date} (top-5 leagues + UCL)")
+    target_date = target_date or date.today()
+    league_names = list(TOP_LEAGUE_IDS.values())
+    logger.info(f"[SCOUT] Collecting intelligence for {target_date} (leagues: {league_names})")
 
     fixtures = await fetch_fixtures(target_date)
     if not fixtures:
-        logger.warning("[SCOUT] No fixtures found in top leagues for this date.")
+        logger.warning("[SCOUT] No fixtures found in configured leagues for this date.")
         return []
 
     prescan_pool = fixtures[:PRESCAN_CAP]
