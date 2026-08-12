@@ -6,7 +6,9 @@ PREVIOUS tickets whose matches have since been played. Grades each
 selection win/loss/void based on the actual final score, then updates
 the ticket's overall outcome.
 
-This is what feeds the Memory Agent's weekly performance report.
+This is what feeds the Memory Agent's weekly performance report, and
+(as of Phase 2) also stores the final score so the website's Results
+page can display real scorelines instead of just win/loss.
 """
 
 import logging
@@ -122,7 +124,15 @@ def run(today: date | None = None) -> None:
                 continue
 
             outcome = grade_selection(sel["market"], result["home_goals"], result["away_goals"])
-            supabase_client.update_selection_outcome(sel["id"], outcome)
+
+            # Store the outcome AND the final score (Phase 2 addition) so the
+            # website can display real scorelines, not just win/loss badges.
+            supabase_client.update_selection_outcome(
+                sel["id"], outcome,
+                home_score=result["home_goals"],
+                away_score=result["away_goals"],
+            )
+
             logger.info(
                 f"[RESULT_CHECK] {sel['home_team']} vs {sel['away_team']} "
                 f"({sel['market']}) -> {outcome} "
