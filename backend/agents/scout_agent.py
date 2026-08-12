@@ -90,12 +90,34 @@ def _load_league_ids() -> dict[int, str]:
 
 TOP_LEAGUE_IDS = _load_league_ids()
 
+
+def _float_env(name: str, default: float) -> float:
+    """
+    Reads a float-valued env var safely. Treats both "unset" AND
+    "set but empty string" (e.g. a workflow env: block with a blank
+    value, or an unpopulated repo variable/secret) as "use the default"
+    instead of crashing with ValueError: could not convert string to
+    float: ''. Also guards against a non-numeric value being pasted in
+    by mistake — logs a warning and falls back rather than crashing the
+    whole pipeline over one bad env var.
+    """
+    raw = os.environ.get(name, "")
+    raw = raw.strip() if raw else ""
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"[SCOUT] Env var {name}='{raw}' is not a valid float — using default {default}.")
+        return default
+
+
 # Minimum data_completeness for a match to count as "qualifying" during
 # Scout's own batch-sizing decisions (see MIN_QUALIFYING_MATCHES below).
 # Overridable via CLEANER_THRESHOLD so a testing run that loosens the
 # Cleaner's bar (in pipeline.py) doesn't leave Scout still pulling extra
 # fallback batches against the old, stricter default.
-CLEANER_THRESHOLD_ENV = float(os.environ.get("CLEANER_THRESHOLD", "0.5"))
+CLEANER_THRESHOLD_ENV = _float_env("CLEANER_THRESHOLD", 0.5)
 
 # Size of the FIRST analysis batch. Each fully-analyzed match costs:
 # 1 injury pair + 1 weather call (API-Football/OpenWeather) + 1 Groq call
