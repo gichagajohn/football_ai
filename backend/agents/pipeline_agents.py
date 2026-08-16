@@ -6,12 +6,22 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from groq import Groq
 
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# Groq's free tier caps llama-3.3-70b-versatile at 30 requests/minute
+# (confirmed via testing — a real run showed near-constant 429s with
+# zero delay between calls, in the loops below specifically). 2.5s
+# comfortably clears the ~2s-minimum spacing that implies, with margin.
+# Only needed in run_analyst() and run_risk_filter() — every other
+# function here (run_portfolio, run_auditor, run_decision, run_publisher)
+# makes exactly ONE Groq call, so there's no intra-function loop to pace.
+GROQ_CALL_DELAY_SECONDS = 2.5
 
 JSON_RULES = """
 
@@ -277,7 +287,7 @@ def _valid(odds: float | None) -> float | None:
 def run_analyst(clean_matches: list[dict]) -> list[dict]:
     """Run probability estimation on clean match data."""
     probabilities = []
-    for match in clean_matches:
+    for i, match in enumerate(clean_matches):
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             max_tokens=2000,
@@ -325,13 +335,19 @@ Return JSON:
             probabilities.append(data)
         else:
             logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
+
+        # Pace requests to stay under Groq's free-tier 30 req/min cap —
+        # skip the sleep after the last match, no point waiting with
+        # nothing left to send.
+        if i < len(clean_matches) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
 
 
 def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list[dict]:
     """Filter out dangerous matches."""
     safe = []
-    for prob in probabilities:
+    for i, prob in enumerate(probabilities):
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -348,12 +364,15 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         risk_data = _extract_json(text)
         if not risk_data:
             logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
-            continue
-        if risk_data.get("approved"):
+        elif risk_data.get("approved"):
             prob["risk_assessment"] = risk_data
             safe.append(prob)
         else:
             logger.info(f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} — {risk_data.get('rejection_reason')}")
+
+        # Same pacing reasoning as run_analyst() above.
+        if i < len(probabilities) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
