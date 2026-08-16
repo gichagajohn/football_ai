@@ -11,9 +11,7 @@ Data sources (as of this version):
   - Injuries:   Official Fantasy Premier League API — Premier League only.
                 Other leagues get an empty injuries list; this is a known
                 gap, not a bug (see fetch_epl_injuries docstring).
-  - Weather:    OpenWeatherMap, keyed off a static team->home-city lookup
-                table since football-data.org's match payload doesn't
-                reliably include a venue city (see TEAM_HOME_CITY below).
+  - Weather:    OpenWeatherMap, unchanged from before.
 
 Uses a two-pass strategy: fetch odds for every fixture in a competition in
 ONE call, match each fixture to its odds by team name, then run full deep
@@ -27,7 +25,6 @@ import json
 import logging
 import os
 import re
-import unicodedata
 from datetime import date
 
 import httpx
@@ -91,145 +88,6 @@ FPL_NAME_ALIASES = {
     "Newcastle": "Newcastle United",
     "Leeds": "Leeds United",
     "Wolves": "Wolverhampton Wanderers",
-}
-
-# Club names where football-data.org's official name and The Odds API's
-# name share NO common substring at all — even after suffix-stripping
-# and removing the connector word "de" (see _normalize_team_name), these
-# still can't be matched generically and need an explicit mapping.
-# Confirmed via live testing against real API responses, not guessed.
-# Keyed by the ALREADY-NORMALIZED (lowercase, suffix/de-stripped) form.
-#
-# CA Osasuna had no fixture in the test window used to find these, so
-# it's untested — if a mismatch turns up for it (or any other club) in
-# a future run, add it here rather than guessing a fix in advance.
-ODDS_TEAM_ALIASES = {
-    "athletic club": "athletic bilbao",  # football-data.org's name for Athletic Bilbao
-}
-# NOTE: keys/values above are written unaccented — _normalize_team_name
-# folds accents before this lookup runs, so this stays correct even
-# though club names in the wild are often accented (e.g. "Atlético").
-
-# Static home-city lookup for weather, keyed by the NORMALIZED
-# (_normalize_team_name) club name. football-data.org's match payload
-# doesn't reliably include a venue city, but a club's home city barely
-# ever changes, so a static table is the practical fix rather than a
-# new API dependency. Home matches are assumed to be played in the home
-# team's city — correct for the vast majority of domestic and UCL group
-# fixtures; the rare neutral-venue final/showcase match would still
-# silently use the "home" club's city, which is a known simplification,
-# not a crash risk (fetch_weather already degrades gracefully on any
-# lookup failure).
-#
-# NOT exhaustive — only the clubs in DEFAULT_LEAGUE_IDS's six
-# competitions as of top-flight rosters at time of writing. A club
-# promoted/relegated into these leagues later, or missing here for any
-# other reason, simply falls back to "no weather for this match" exactly
-# as before — nothing breaks, it just misses weather_risk for that one
-# fixture until added below.
-TEAM_HOME_CITY = {
-    # Premier League
-    "arsenal": "London,GB",
-    "aston villa": "Birmingham,GB",
-    "bournemouth": "Bournemouth,GB",
-    "brentford": "London,GB",
-    "brighton and hove albion": "Brighton,GB",
-    "burnley": "Burnley,GB",
-    "chelsea": "London,GB",
-    "crystal palace": "London,GB",
-    "everton": "Liverpool,GB",
-    "fulham": "London,GB",
-    "leeds united": "Leeds,GB",
-    "liverpool": "Liverpool,GB",
-    "manchester city": "Manchester,GB",
-    "manchester united": "Manchester,GB",
-    "newcastle united": "Newcastle upon Tyne,GB",
-    "nottingham forest": "Nottingham,GB",
-    "sunderland": "Sunderland,GB",
-    "tottenham hotspur": "London,GB",
-    "west ham united": "London,GB",
-    "wolverhampton wanderers": "Wolverhampton,GB",
-    # La Liga
-    "alaves": "Vitoria-Gasteiz,ES",
-    "deportivo alaves": "Vitoria-Gasteiz,ES",
-    "athletic bilbao": "Bilbao,ES",
-    "atletico madrid": "Madrid,ES",
-    "barcelona": "Barcelona,ES",
-    "celta vigo": "Vigo,ES",
-    "elche": "Elche,ES",
-    "espanyol": "Barcelona,ES",
-    "getafe": "Getafe,ES",
-    "girona": "Girona,ES",
-    "levante": "Valencia,ES",
-    "mallorca": "Palma,ES",
-    "osasuna": "Pamplona,ES",
-    "rayo vallecano": "Madrid,ES",
-    "real betis": "Seville,ES",
-    "real madrid": "Madrid,ES",
-    "real oviedo": "Oviedo,ES",
-    "real sociedad": "San Sebastian,ES",
-    "sevilla": "Seville,ES",
-    "valencia": "Valencia,ES",
-    "villarreal": "Villarreal,ES",
-    # Bundesliga
-    "bayer leverkusen": "Leverkusen,DE",
-    "bayern munich": "Munich,DE",
-    "borussia dortmund": "Dortmund,DE",
-    "borussia monchengladbach": "Monchengladbach,DE",
-    "eintracht frankfurt": "Frankfurt,DE",
-    "fc augsburg": "Augsburg,DE",
-    "fc cologne": "Cologne,DE",
-    "fc heidenheim": "Heidenheim,DE",
-    "fc st pauli": "Hamburg,DE",
-    "freiburg": "Freiburg,DE",
-    "hamburger sv": "Hamburg,DE",
-    "hoffenheim": "Sinsheim,DE",
-    "mainz 05": "Mainz,DE",
-    "rb leipzig": "Leipzig,DE",
-    "union berlin": "Berlin,DE",
-    "vfb stuttgart": "Stuttgart,DE",
-    "vfl wolfsburg": "Wolfsburg,DE",
-    "werder bremen": "Bremen,DE",
-    # Serie A
-    "atalanta": "Bergamo,IT",
-    "bologna": "Bologna,IT",
-    "cagliari": "Cagliari,IT",
-    "como": "Como,IT",
-    "cremonese": "Cremona,IT",
-    "fiorentina": "Florence,IT",
-    "genoa": "Genoa,IT",
-    "hellas verona": "Verona,IT",
-    "inter": "Milan,IT",
-    "juventus": "Turin,IT",
-    "lazio": "Rome,IT",
-    "lecce": "Lecce,IT",
-    "milan": "Milan,IT",
-    "napoli": "Naples,IT",
-    "parma": "Parma,IT",
-    "pisa": "Pisa,IT",
-    "roma": "Rome,IT",
-    "sassuolo": "Sassuolo,IT",
-    "torino": "Turin,IT",
-    "udinese": "Udine,IT",
-    # Ligue 1
-    "angers": "Angers,FR",
-    "auxerre": "Auxerre,FR",
-    "brest": "Brest,FR",
-    "le havre": "Le Havre,FR",
-    "lens": "Lens,FR",
-    "lille": "Lille,FR",
-    "lorient": "Lorient,FR",
-    "lyon": "Lyon,FR",
-    "marseille": "Marseille,FR",
-    "metz": "Metz,FR",
-    "monaco": "Monaco,MC",
-    "nantes": "Nantes,FR",
-    "nice": "Nice,FR",
-    "paris saint germain": "Paris,FR",
-    "paris fc": "Paris,FR",
-    "rennes": "Rennes,FR",
-    "strasbourg": "Strasbourg,FR",
-    "toulouse": "Toulouse,FR",
 }
 
 
@@ -348,24 +206,12 @@ async def fetch_fixtures(target_date: date) -> list[dict]:
     """
     all_matches = []
     date_str = target_date.isoformat()
-    api_key = os.environ.get("FOOTBALL_DATA_KEY", "")
-    if not api_key:
-        # This alone would explain a 403 on every competition — a missing
-        # key sends an empty X-Auth-Token header, which football-data.org
-        # rejects. Logging this explicitly turns "guess why it's 403"
-        # into "confirmed, the secret isn't reaching this process."
-        logger.error(
-            "[SCOUT] FOOTBALL_DATA_KEY is empty/unset in this environment — "
-            "every fixture fetch below will fail with 403. Check that the "
-            "GitHub Secret is named exactly FOOTBALL_DATA_KEY and is passed "
-            "through in the workflow's env: block."
-        )
     async with httpx.AsyncClient(timeout=30) as http:
         for code, league_name in TOP_LEAGUE_IDS.items():
             try:
                 resp = await http.get(
                     f"{FOOTBALL_DATA_BASE}/competitions/{code}/matches",
-                    headers={"X-Auth-Token": api_key},
+                    headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
                     params={"dateFrom": date_str, "dateTo": date_str},
                 )
                 resp.raise_for_status()
@@ -375,19 +221,6 @@ async def fetch_fixtures(target_date: date) -> list[dict]:
                 if matches:
                     logger.info(f"[SCOUT] {league_name}: {len(matches)} fixture(s) found.")
                 all_matches.extend(matches)
-            except httpx.HTTPStatusError as e:
-                # football-data.org's actual error message (e.g. "Invalid
-                # authentication credentials" vs an IP/rate-limit message)
-                # is in the response BODY, not just the status code — the
-                # default exception string only shows "403 Forbidden" with
-                # no explanation. Logging the body is what actually tells
-                # us WHY, instead of guessing between "bad key" and
-                # "football-data.org is blocking this IP range."
-                body_snippet = e.response.text[:300] if e.response is not None else "(no response body)"
-                logger.warning(
-                    f"[SCOUT] Fixture fetch failed for {league_name}: "
-                    f"HTTP {e.response.status_code if e.response is not None else '?'} — {body_snippet}"
-                )
             except Exception as e:
                 logger.warning(f"[SCOUT] Fixture fetch failed for {league_name}: {e}")
             # football-data.org free tier is 10 req/min — 6 sequential
@@ -426,48 +259,23 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
 
 def _normalize_team_name(name: str) -> str:
     """
-    Strips common club-name suffixes, removes the standalone connector
-    word "de", and normalizes '&' vs 'and' so names from different
-    providers compare equal. Confirmed via live testing against real
-    API responses (not guessed):
-
-      - "Arsenal FC" vs "Arsenal" — suffix strip
-      - "Brighton & Hove Albion FC" vs "Brighton and Hove Albion" — &/and
-      - "RC Celta de Vigo" vs "Celta Vigo" — "de" removal
-      - "Club Atlético de Madrid" vs "Atlético Madrid" — "de" removal
-
-    The "de" removal only strips it as a STANDALONE word (regex \\bde\\b),
-    so it never touches names that merely contain "de" as part of a
-    longer word (e.g. "Deportivo" is untouched — confirmed this doesn't
-    cause any false matches against the other clubs tested).
-
+    Strips common club-name suffixes and normalizes '&' vs 'and' so names
+    from different providers ("Arsenal FC" vs "Arsenal", "Brighton &
+    Hove Albion FC" vs "Brighton and Hove Albion") compare equal. The
+    '&'/'and' case was found via a real live test against The Odds API,
+    not a guess — football-data.org uses '&', The Odds API spells it out.
     Not exhaustive — this is fuzzy matching, not an ID join, so an
-    unusual club name (e.g. "Athletic Club" vs "Athletic Bilbao", which
-    share no word at all) can still fail to match generically. Those
-    known cases are covered by ODDS_TEAM_ALIASES above. If a new one
-    turns up in testing, add it there (for odds) or to FPL_NAME_ALIASES
-    (for injuries) rather than making this function more elaborate.
-
-    Accented characters (e.g. "Alavés", "Atlético") ARE folded to their
-    ASCII base form (-> "alaves", "atletico") via unicodedata, so
-    TEAM_HOME_CITY and ODDS_TEAM_ALIASES can be written without accents
-    and still match a provider that sends accented names. Caught this
-    the hard way: football-data.org's own fixture data for "Deportivo
-    Alavés" failed to match an unaccented "alaves" table entry until
-    this fold was added — verified by testing against that exact name.
+    unusual club name could still occasionally fail to match. If that
+    happens in testing, add the specific case to FPL_NAME_ALIASES (for
+    injuries) or extend this function (for odds).
     """
     name = name.strip()
     for suffix in (" FC", " CF", " AFC", " CD", " SD", " AC"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
     name = name.replace("&", "and")
-    name = re.sub(r"\bde\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\s+", " ", name)
-    normalized = name.strip().lower()
-    # Fold accented characters to their ASCII base (é -> e, í -> i, etc.)
-    normalized = unicodedata.normalize("NFKD", normalized)
-    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-    return ODDS_TEAM_ALIASES.get(normalized, normalized)
+    return name.strip().lower()
 
 
 def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
@@ -571,36 +379,17 @@ def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict
     return []
 
 
-def _lookup_home_city(home_team_name: str) -> str | None:
-    """
-    Looks up the home city for a fixture from TEAM_HOME_CITY, using the
-    same normalized-name matching approach as odds/injury lookups
-    (exact match first, then substring match, so "Real Madrid CF" still
-    hits the "real madrid" entry). Returns None if the club isn't in the
-    table — fetch_weather already handles that gracefully by skipping
-    the weather call, exactly as it did before this table existed.
-    """
-    target = _normalize_team_name(home_team_name)
-    if target in TEAM_HOME_CITY:
-        return TEAM_HOME_CITY[target]
-    for club, city in TEAM_HOME_CITY.items():
-        if club in target or target in club:
-            return city
-    return None
-
-
 async def fetch_weather(venue_city: str | None) -> dict:
     """
     Fetch weather forecast for match venue. Returns blank dict if no
     city known.
 
-    venue_city is now resolved by the caller via _lookup_home_city()
-    against the static TEAM_HOME_CITY table, since football-data.org's
-    match objects don't reliably include a venue city directly. This
-    function itself is unchanged — it still just degrades gracefully to
-    "unknown" whenever venue_city is None, whether that's because the
-    club isn't in TEAM_HOME_CITY yet or because of a genuine neutral-
-    venue/unknown-venue fixture.
+    NOTE: football-data.org's match objects don't reliably include a
+    venue city the way API-Football's did, so venue_city will often be
+    None now — this function already degrades gracefully in that case,
+    same as before, so nothing breaks. A team->home-city lookup table
+    would fix this properly; treating that as a separate follow-up
+    rather than bundling it into this provider swap.
     """
     if not venue_city:
         logger.info("[SCOUT] No venue city available — skipping weather fetch.")
@@ -718,7 +507,7 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
     home_name = fixture["homeTeam"]["name"]
     away_name = fixture["awayTeam"]["name"]
     competition_code = fixture.get("_competition_code")
-    venue_city = _lookup_home_city(home_name)  # see TEAM_HOME_CITY above
+    venue_city = None  # see fetch_weather() docstring for why
 
     odds_snapshot = _extract_odds_snapshot(odds_event) if odds_event else {}
 
@@ -867,7 +656,8 @@ async def run(target_date: date | None = None) -> list[dict]:
         for fixture, odds_event in batch:
             structured = await _deep_analyze(fixture, odds_event, epl_injuries)
             results.append(structured)
-            await asyncio.sleep(1)  # ease rate limits on weather/Groq
+            await asyncio.sleep(2.5)  # Groq free tier: confirmed 30 req/min cap for
+            # llama-3.3-70b-versatile — 2.5s clears the ~2s minimum spacing with margin
 
         qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
         logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
