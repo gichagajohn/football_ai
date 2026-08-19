@@ -14,13 +14,7 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Groq's free tier caps llama-3.3-70b-versatile at 30 requests/minute
-# (confirmed via testing — a real run showed near-constant 429s with
-# zero delay between calls, in the loops below specifically). 2.5s
-# comfortably clears the ~2s-minimum spacing that implies, with margin.
-# Only needed in run_analyst() and run_risk_filter() — every other
-# function here (run_portfolio, run_auditor, run_decision, run_publisher)
-# makes exactly ONE Groq call, so there's no intra-function loop to pace.
+# Groq call delay — keep requests within free-tier rate limits.
 GROQ_CALL_DELAY_SECONDS = 2.5
 
 JSON_RULES = """
@@ -217,9 +211,6 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
-# Maps our internal market keys to the odds_snapshot fields provided by Scout.
-# Double Chance and Draw No Bet aren't usually given directly by bookmakers in
-# odds_snapshot, so we derive them from the 1X2 odds using standard formulas.
 def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
     """
     Return real decimal odds (>= 1.01) for a given market key, derived from
@@ -242,7 +233,6 @@ def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
         if market == "over25":
             return _valid(odds_snapshot.get("over25"))
 
-        # Double Chance: 1/(1/a + 1/b) using implied probabilities
         if market == "double_chance_home" and home and draw:
             implied = (1 / home) + (1 / draw)
             return _valid(round(1 / implied, 3)) if implied > 0 else None
@@ -250,7 +240,6 @@ def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
             implied = (1 / away) + (1 / draw)
             return _valid(round(1 / implied, 3)) if implied > 0 else None
 
-        # Draw No Bet (approximation): redistribute draw probability proportionally
         if market == "draw_no_bet_home" and home and draw:
             p_home = 1 / home
             p_draw = 1 / draw
@@ -264,8 +253,6 @@ def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
             adj_p_away = p_away / (p_home + p_away) if (p_home + p_away) > 0 else None
             return _valid(round(1 / adj_p_away, 3)) if adj_p_away else None
 
-        # over15 / under45 — not directly in odds_snapshot; cannot derive reliably.
-        # Returning None causes this selection to be skipped rather than faked.
         return None
     except (TypeError, ZeroDivisionError):
         return None
@@ -289,7 +276,7 @@ def run_analyst(clean_matches: list[dict]) -> list[dict]:
     probabilities = []
     for i, match in enumerate(clean_matches):
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             max_tokens=2000,
             messages=[
                 {"role": "system", "content": ANALYST_PROMPT},
@@ -328,17 +315,12 @@ Return JSON:
             data.setdefault("fixture_id", match.get("fixture_id"))
             data.setdefault("home_team", match.get("home_team"))
             data.setdefault("away_team", match.get("away_team"))
-            # Carry forward fields needed downstream by Portfolio (odds lookup)
-            # and Risk (intelligence merge) that the LLM doesn't need to repeat.
             data["odds_snapshot"] = match.get("odds_snapshot", {})
             data["league"] = match.get("league")
             probabilities.append(data)
         else:
             logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
 
-        # Pace requests to stay under Groq's free-tier 30 req/min cap —
-        # skip the sleep after the last match, no point waiting with
-        # nothing left to send.
         if i < len(clean_matches) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
@@ -350,7 +332,7 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
     for i, prob in enumerate(probabilities):
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             max_tokens=800,
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
@@ -370,29 +352,20 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         else:
             logger.info(f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} — {risk_data.get('rejection_reason')}")
 
-        # Same pacing reasoning as run_analyst() above.
         if i < len(probabilities) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
 def run_portfolio(safe_matches: list[dict]) -> dict:
-    """
-    Build the optimal ticket from safe candidates.
-
-    The LLM selects WHICH match+market combinations to use. Actual odds
-    are then computed deterministically in Python from each match's
-    odds_snapshot, so the final combined_odds is always mathematically
-    correct (never hallucinated by the LLM).
-    """
+    """Build the optimal ticket from safe candidates."""
     if len(safe_matches) < 2:
         return {"decision": "NO_BET", "reason": "Insufficient safe candidates after risk filtering."}
 
-    # Build a lookup so we can find odds_snapshot + team names by fixture_id
     match_lookup = {m.get("fixture_id"): m for m in safe_matches}
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         max_tokens=2000,
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
@@ -415,7 +388,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     if len(raw_selections) < 2:
         return {"decision": "NO_BET", "reason": "Portfolio agent selected fewer than 2 matches."}
 
-    # ── Compute real odds for each selection ─────────────────────
     final_selections = []
     combined_odds = 1.0
     skipped = []
@@ -457,7 +429,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             "reason": f"Fewer than 2 selections had derivable odds. Skipped: {skipped}",
         }
 
-    # Cap at 5 selections (spec limit), keeping the first 5 in priority order
     final_selections = final_selections[:5]
     combined_odds = 1.0
     for s in final_selections:
@@ -478,7 +449,7 @@ def run_auditor(portfolio: dict) -> dict:
         return {"auditor_verdict": "REJECT", "critical_flags": ["No portfolio to audit — already NO_BET."]}
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         max_tokens=2000,
         messages=[
             {"role": "system", "content": AUDITOR_PROMPT},
@@ -505,7 +476,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
         return {"decision": "NO_BET", "reason": f"Auditor rejected: {audited.get('critical_flags')}", "final_confidence": 0.0}
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         max_tokens=500,
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
@@ -521,11 +492,6 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
         logger.error(f"Decision parse error: {text[:200]}")
         return {"decision": "NO_BET", "reason": "Decision agent error — defaulting safe.", "final_confidence": 0.0}
 
-    # ── Python-side sanity override ──────────────────────────────
-    # LLMs sometimes reason their way to NO_BET in the "reason" text but
-    # leave the "decision" field as PUBLISH (or vice versa). We don't trust
-    # the field alone — re-derive it from the numeric thresholds, which are
-    # the actual spec requirements.
     final_confidence = data.get("final_confidence")
     combined_odds = portfolio.get("combined_odds")
 
@@ -577,7 +543,7 @@ Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         max_tokens=1500,
         messages=[
             {"role": "system", "content": PUBLISHER_PROMPT},
