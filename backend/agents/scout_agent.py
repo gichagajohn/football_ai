@@ -439,7 +439,7 @@ def _extract_json(text: str) -> dict:
 def analyze_with_groq(raw_data: dict) -> dict:
     """Use the LLM to structure and enrich the raw scout data."""
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         max_tokens=4096,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -580,7 +580,7 @@ async def run(target_date: date | None = None) -> list[dict]:
       The Odds API (free tier: 500 credits/month):
         - up to 6 calls: one per competition PRESENT today, at
           2 credits each (h2h + totals markets, 1 region) = up to 12
-          credits/day ≈ 360/month — comfortably under the 500 cap, even
+          credits/day approximately 360/month — comfortably under the 500 cap, even
           allowing room for occasional re-runs.
       Fantasy Premier League API (free, no key, no practical rate limit):
         - 1 call, only if PL fixtures are present today.
@@ -594,6 +594,7 @@ async def run(target_date: date | None = None) -> list[dict]:
         re-triggering the workflow multiple times on the same day (e.g.
         for testing) can still exhaust the daily Groq quota — this was
         observed during development testing, not a bug in the logic.
+        Model in use: openai/gpt-oss-120b (replaces deprecated openai/gpt-oss-120b)
     """
     target_date = target_date or date.today()
     league_names = list(TOP_LEAGUE_IDS.values())
@@ -637,7 +638,7 @@ async def run(target_date: date | None = None) -> list[dict]:
         f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds. Prioritizing those first."
     )
 
-    # ── Deep analysis — first batch, then fallback if needed ──
+    # Deep analysis — first batch, then fallback if needed
     results: list[dict] = []
     cursor = 0
     is_first_batch = True
@@ -656,8 +657,7 @@ async def run(target_date: date | None = None) -> list[dict]:
         for fixture, odds_event in batch:
             structured = await _deep_analyze(fixture, odds_event, epl_injuries)
             results.append(structured)
-            await asyncio.sleep(2.5)  # Groq free tier: confirmed 30 req/min cap for
-            # llama-3.3-70b-versatile — 2.5s clears the ~2s minimum spacing with margin
+            await asyncio.sleep(2.5)
 
         qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
         logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
