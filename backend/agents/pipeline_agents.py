@@ -14,8 +14,11 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Groq call delay — keep requests within free-tier rate limits.
-GROQ_CALL_DELAY_SECONDS = 2.5
+# Model: llama-3.1-8b-instant — 20,000 TPM free tier, avoids 429s from openai/gpt-oss-120b (8,000 TPM)
+GROQ_MODEL = "llama-3.1-8b-instant"
+
+# 6s between calls keeps us well under Groq's 30 RPM free-tier cap
+GROQ_CALL_DELAY_SECONDS = 6
 
 JSON_RULES = """
 
@@ -190,7 +193,6 @@ before or after."""
 
 
 def _extract_json(text: str) -> dict:
-    """Robustly extract a JSON object from an LLM response."""
     if not text:
         return {}
     try:
@@ -212,11 +214,6 @@ def _extract_json(text: str) -> dict:
 
 
 def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
-    """
-    Return real decimal odds (>= 1.01) for a given market key, derived from
-    odds_snapshot. Returns None if the required underlying odds are missing
-    or the derived value would be invalid.
-    """
     try:
         home = odds_snapshot.get("home_win")
         draw = odds_snapshot.get("draw")
@@ -232,14 +229,12 @@ def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
             return _valid(odds_snapshot.get("btts_yes"))
         if market == "over25":
             return _valid(odds_snapshot.get("over25"))
-
         if market == "double_chance_home" and home and draw:
             implied = (1 / home) + (1 / draw)
             return _valid(round(1 / implied, 3)) if implied > 0 else None
         if market == "double_chance_away" and away and draw:
             implied = (1 / away) + (1 / draw)
             return _valid(round(1 / implied, 3)) if implied > 0 else None
-
         if market == "draw_no_bet_home" and home and draw:
             p_home = 1 / home
             p_draw = 1 / draw
@@ -252,14 +247,12 @@ def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
             p_away = 1 / away
             adj_p_away = p_away / (p_home + p_away) if (p_home + p_away) > 0 else None
             return _valid(round(1 / adj_p_away, 3)) if adj_p_away else None
-
         return None
     except (TypeError, ZeroDivisionError):
         return None
 
 
 def _valid(odds: float | None) -> float | None:
-    """Return odds only if they're a sane decimal odds value (>= 1.01)."""
     if odds is None:
         return None
     try:
@@ -272,12 +265,11 @@ def _valid(odds: float | None) -> float | None:
 
 
 def run_analyst(clean_matches: list[dict]) -> list[dict]:
-    """Run probability estimation on clean match data."""
     probabilities = []
     for i, match in enumerate(clean_matches):
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            max_tokens=2000,
+            model=GROQ_MODEL,
+            max_tokens=1500,
             messages=[
                 {"role": "system", "content": ANALYST_PROMPT},
                 {
@@ -320,20 +312,18 @@ Return JSON:
             probabilities.append(data)
         else:
             logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
-
         if i < len(clean_matches) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
 
 
 def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list[dict]:
-    """Filter out dangerous matches."""
     safe = []
     for i, prob in enumerate(probabilities):
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            max_tokens=800,
+            model=GROQ_MODEL,
+            max_tokens=600,
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
                 {
@@ -351,22 +341,20 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
             safe.append(prob)
         else:
             logger.info(f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} — {risk_data.get('rejection_reason')}")
-
         if i < len(probabilities) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
 def run_portfolio(safe_matches: list[dict]) -> dict:
-    """Build the optimal ticket from safe candidates."""
     if len(safe_matches) < 2:
         return {"decision": "NO_BET", "reason": "Insufficient safe candidates after risk filtering."}
 
     match_lookup = {m.get("fixture_id"): m for m in safe_matches}
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        max_tokens=2000,
+        model=GROQ_MODEL,
+        max_tokens=1500,
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
             {
@@ -389,7 +377,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
         return {"decision": "NO_BET", "reason": "Portfolio agent selected fewer than 2 matches."}
 
     final_selections = []
-    combined_odds = 1.0
     skipped = []
 
     for sel in raw_selections:
@@ -399,7 +386,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
         if not match:
             skipped.append(f"fixture {fixture_id} not found in safe matches")
             continue
-
         odds_snapshot = match.get("odds_snapshot", {}) or {}
         odds = _derive_odds(market, odds_snapshot)
         if odds is None:
@@ -408,7 +394,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 f"({market}): could not derive valid odds from available data"
             )
             continue
-
         final_selections.append({
             "fixture_id": fixture_id,
             "home_team": match.get("home_team"),
@@ -418,16 +403,12 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             "odds": odds,
             "rationale": sel.get("rationale", ""),
         })
-        combined_odds *= odds
 
     if skipped:
         logger.info(f"[PORTFOLIO] Skipped selections: {skipped}")
 
     if len(final_selections) < 2:
-        return {
-            "decision": "NO_BET",
-            "reason": f"Fewer than 2 selections had derivable odds. Skipped: {skipped}",
-        }
+        return {"decision": "NO_BET", "reason": f"Fewer than 2 selections had derivable odds. Skipped: {skipped}"}
 
     final_selections = final_selections[:5]
     combined_odds = 1.0
@@ -444,13 +425,12 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
 
 
 def run_auditor(portfolio: dict) -> dict:
-    """Challenge the portfolio adversarially."""
     if portfolio.get("decision") == "NO_BET":
         return {"auditor_verdict": "REJECT", "critical_flags": ["No portfolio to audit — already NO_BET."]}
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        max_tokens=2000,
+        model=GROQ_MODEL,
+        max_tokens=1500,
         messages=[
             {"role": "system", "content": AUDITOR_PROMPT},
             {
@@ -468,7 +448,6 @@ def run_auditor(portfolio: dict) -> dict:
 
 
 def run_decision(audited: dict, portfolio: dict) -> dict:
-    """Final publish/no-bet decision."""
     if portfolio.get("decision") == "NO_BET":
         return {"decision": "NO_BET", "reason": portfolio.get("reason", "No valid portfolio constructed."), "final_confidence": 0.0}
 
@@ -476,8 +455,8 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
         return {"decision": "NO_BET", "reason": f"Auditor rejected: {audited.get('critical_flags')}", "final_confidence": 0.0}
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        max_tokens=500,
+        model=GROQ_MODEL,
+        max_tokens=400,
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
             {
@@ -497,24 +476,17 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
 
     if final_confidence is not None and final_confidence < 0.78:
         if data.get("decision") == "PUBLISH":
-            logger.warning(
-                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
-                f"final_confidence={final_confidence} < 0.78"
-            )
+            logger.warning(f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: final_confidence={final_confidence} < 0.78")
         data["decision"] = "NO_BET"
         if "below" not in str(data.get("reason", "")).lower():
             data["reason"] = (
-                f"Overridden to NO_BET: final_confidence "
-                f"({final_confidence}) is below the 0.78 publish threshold. "
+                f"Overridden to NO_BET: final_confidence ({final_confidence}) is below the 0.78 publish threshold. "
                 f"Original reasoning: {data.get('reason', '')}"
             )
 
     if combined_odds is not None and not (8.0 <= combined_odds <= 13.0):
         if data.get("decision") == "PUBLISH":
-            logger.warning(
-                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
-                f"combined_odds={combined_odds} outside 8.0-13.0 range"
-            )
+            logger.warning(f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: combined_odds={combined_odds} outside 8.0-13.0 range")
         data["decision"] = "NO_BET"
         data["reason"] = (
             f"Overridden to NO_BET: combined_odds ({combined_odds}) is outside "
@@ -525,7 +497,6 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
 
 
 def run_publisher(portfolio: dict, decision: dict, audited: dict, target_date: str) -> str:
-    """Generate the final human-readable ticket."""
     if decision.get("decision") == "NO_BET":
         return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔵 FOOTBALL PULSE AI
@@ -543,8 +514,8 @@ Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        max_tokens=1500,
+        model=GROQ_MODEL,
+        max_tokens=1200,
         messages=[
             {"role": "system", "content": PUBLISHER_PROMPT},
             {
