@@ -332,7 +332,6 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         response = client.chat.completions.create(
             model=GROQ_MODEL,
             max_tokens=1200,
-            reasoning_effort="low",
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
                 {
@@ -477,7 +476,6 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         max_tokens=900,
-        reasoning_effort="low",
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
             {
