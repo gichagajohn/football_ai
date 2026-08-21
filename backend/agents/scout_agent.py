@@ -33,10 +33,6 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# football-data.org competition codes for the top 5 European leagues + UCL.
-# https://docs.football-data.org/general/v4/competitions.html
-# This is the DEFAULT set used whenever LEAGUE_IDS is not set in the
-# environment — i.e. normal daily production runs.
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
     "PD": "La Liga",
@@ -46,11 +42,6 @@ DEFAULT_LEAGUE_IDS = {
     "CL": "UEFA Champions League",
 }
 
-# Friendly names for the OTHER competition codes covered by
-# football-data.org's free tier, used only for nicer log output when
-# testing with a LEAGUE_IDS override below. NOTE: unlike the old
-# API-Football version, this is now a closed list — the free tier only
-# has these 12 competitions, so an override outside this set will 404.
 KNOWN_LEAGUE_NAMES = {
     **DEFAULT_LEAGUE_IDS,
     "DED": "Eredivisie",
@@ -61,10 +52,6 @@ KNOWN_LEAGUE_NAMES = {
     "EC": "European Championship",
 }
 
-# Maps a football-data.org competition code to the sport key The Odds API
-# uses for that same competition. Only competitions in this dict will get
-# odds fetched — anything else (e.g. an ELC/BSA override) simply won't
-# have odds available, and degrades gracefully like any other missing field.
 ODDS_SPORT_KEYS = {
     "PL": "soccer_epl",
     "PD": "soccer_spain_la_liga",
@@ -74,12 +61,6 @@ ODDS_SPORT_KEYS = {
     "CL": "soccer_uefa_champs_league",
 }
 
-# A handful of club names that are spelled differently between
-# football-data.org (usually the formal/legal name, e.g. "Newcastle
-# United FC") and the Fantasy Premier League API (usually the short
-# common name, e.g. "Newcastle"). Only needed for injury matching, since
-# that's the only place we cross-reference two providers by name instead
-# of by a shared ID. Add to this if a new mismatch turns up in testing.
 FPL_NAME_ALIASES = {
     "Nott'm Forest": "Nottingham Forest",
     "Spurs": "Tottenham Hotspur",
@@ -90,30 +71,23 @@ FPL_NAME_ALIASES = {
     "Wolves": "Wolverhampton Wanderers",
 }
 
+# Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier,
+# which is enough headroom for back-to-back fixture analyses without 429s.
+GROQ_MODEL = "llama-3.1-8b-instant"
+
+# Seconds to wait between consecutive Groq calls inside the fixture loop.
+# 6s gives ~10 calls/min, well under the 30 RPM free-tier cap.
+GROQ_CALL_DELAY_SECONDS = 6
+
 
 def _load_league_ids() -> dict[str, str]:
-    """
-    Reads the LEAGUE_IDS env var (comma-separated football-data.org
-    competition codes, e.g. "PL,PD,DED") if set, otherwise falls back to
-    the normal top-5 + UCL default. This is meant for one-off testing
-    runs — e.g. to confirm the pipeline works end-to-end on a day when
-    top-5+UCL happens to have no fixtures — without editing this file
-    back and forth. For normal daily runs, just leave LEAGUE_IDS unset.
-
-    NOTE: codes must be from football-data.org's free-tier competition
-    list (see KNOWN_LEAGUE_NAMES) — unlike the old API-Football numeric
-    IDs, these aren't arbitrary; an unsupported code will 404 at fetch time.
-    """
     override = os.environ.get("LEAGUE_IDS", "").strip()
     if not override:
         return DEFAULT_LEAGUE_IDS
-
     codes = [part.strip().upper() for part in override.split(",") if part.strip()]
-
     if not codes:
         logger.warning("[SCOUT] LEAGUE_IDS was set but contained no valid codes — falling back to default top-5+UCL.")
         return DEFAULT_LEAGUE_IDS
-
     result = {c: KNOWN_LEAGUE_NAMES.get(c, f"Competition {c}") for c in codes}
     logger.info(f"[SCOUT] LEAGUE_IDS override active — using {len(result)} competition(s): {list(result.values())}")
     return result
@@ -123,15 +97,6 @@ TOP_LEAGUE_IDS = _load_league_ids()
 
 
 def _float_env(name: str, default: float) -> float:
-    """
-    Reads a float-valued env var safely. Treats both "unset" AND
-    "set but empty string" (e.g. a workflow env: block with a blank
-    value, or an unpopulated repo variable/secret) as "use the default"
-    instead of crashing with ValueError: could not convert string to
-    float: ''. Also guards against a non-numeric value being pasted in
-    by mistake — logs a warning and falls back rather than crashing the
-    whole pipeline over one bad env var.
-    """
     raw = os.environ.get(name, "")
     raw = raw.strip() if raw else ""
     if not raw:
@@ -143,23 +108,8 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-# Minimum data_completeness for a match to count as "qualifying" during
-# Scout's own batch-sizing decisions (see MIN_QUALIFYING_MATCHES below).
-# Overridable via CLEANER_THRESHOLD so a testing run that loosens the
-# Cleaner's bar (in pipeline.py) doesn't leave Scout still pulling extra
-# fallback batches against the old, stricter default.
 CLEANER_THRESHOLD_ENV = _float_env("CLEANER_THRESHOLD", 0.5)
-
-# Size of the FIRST analysis batch. Each fully-analyzed match costs:
-# 1 weather call (OpenWeather) + 1 Groq call for Scout structuring
-# (injuries and odds are now fetched once per COMPETITION up front, not
-# per match — see run()). Kept at 12 (not equal to HARD_CAP_MATCHES) so
-# the fallback batch below actually has room to run if needed.
 MAX_MATCHES_PER_DAY = 12
-
-# Size of each FALLBACK batch, pulled in only if the first batch didn't
-# yield enough qualifying matches. Smaller than the first batch to keep
-# total token usage predictable.
 FALLBACK_BATCH_SIZE = 6
 
 SYSTEM_PROMPT = """You are the SCOUT AGENT for Football Pulse AI.
@@ -194,16 +144,6 @@ FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 
 
 async def fetch_fixtures(target_date: date) -> list[dict]:
-    """
-    Fetch fixtures for the target date, filtered to top leagues, via
-    football-data.org. Each returned match dict is tagged with
-    "_competition_code" so downstream code (run(), _deep_analyze) knows
-    which competition it belongs to without re-deriving it.
-
-    NOTE: no season-year parameter needed here — football-data.org
-    filters by date range directly, which is what eliminated the whole
-    class of "season=2026 has no data yet" bug we had with API-Football.
-    """
     all_matches = []
     date_str = target_date.isoformat()
     async with httpx.AsyncClient(timeout=30) as http:
@@ -223,22 +163,11 @@ async def fetch_fixtures(target_date: date) -> list[dict]:
                 all_matches.extend(matches)
             except Exception as e:
                 logger.warning(f"[SCOUT] Fixture fetch failed for {league_name}: {e}")
-            # football-data.org free tier is 10 req/min — 6 sequential
-            # calls comfortably clears that even without this, but this
-            # keeps it safe if more competitions get added later.
             await asyncio.sleep(1)
-
     return all_matches
 
 
 async def fetch_league_odds(sport_key: str) -> list[dict]:
-    """
-    Fetch odds for EVERY upcoming fixture in one competition, in a
-    single call — this is the free-tier-friendly shape of The Odds API:
-    you pay per (market x region), not per fixture. Returns [] on any
-    failure (missing/invalid key, competition out of season, etc.) so a
-    problem with one competition's odds never blocks the whole run.
-    """
     async with httpx.AsyncClient(timeout=20) as http:
         try:
             resp = await http.get(
@@ -258,17 +187,6 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
 
 
 def _normalize_team_name(name: str) -> str:
-    """
-    Strips common club-name suffixes and normalizes '&' vs 'and' so names
-    from different providers ("Arsenal FC" vs "Arsenal", "Brighton &
-    Hove Albion FC" vs "Brighton and Hove Albion") compare equal. The
-    '&'/'and' case was found via a real live test against The Odds API,
-    not a guess — football-data.org uses '&', The Odds API spells it out.
-    Not exhaustive — this is fuzzy matching, not an ID join, so an
-    unusual club name could still occasionally fail to match. If that
-    happens in testing, add the specific case to FPL_NAME_ALIASES (for
-    injuries) or extend this function (for odds).
-    """
     name = name.strip()
     for suffix in (" FC", " CF", " AFC", " CD", " SD", " AC"):
         if name.endswith(suffix):
@@ -279,7 +197,6 @@ def _normalize_team_name(name: str) -> str:
 
 
 def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
-    """Matches one football-data.org fixture to its Odds API event by team name."""
     home_norm = _normalize_team_name(home_name)
     away_norm = _normalize_team_name(away_name)
     for event in odds_events:
@@ -291,17 +208,6 @@ def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) ->
 
 
 def _extract_odds_snapshot(odds_event: dict) -> dict:
-    """
-    Best-effort extraction of home/draw/away/over25 odds from The Odds
-    API's event structure. Picks whichever bookmaker appears first in
-    the response (free-tier bookmaker availability varies by
-    event/region, so there's no fixed "always use this book" choice
-    the way the old API-Football version pinned to Bet365).
-
-    btts_yes is intentionally left unset — this provider's free
-    bookmaker set doesn't reliably carry a BTTS market. Same as any
-    other genuinely-missing field, the LLM marks it UNKNOWN downstream.
-    """
     snapshot = {}
     bookmakers = odds_event.get("bookmakers", [])
     if not bookmakers:
@@ -327,20 +233,6 @@ def _extract_odds_snapshot(odds_event: dict) -> dict:
 
 
 async def fetch_epl_injuries() -> dict[str, list[dict]]:
-    """
-    Fetches current player availability for ALL Premier League clubs in
-    ONE call to the official Fantasy Premier League API (free, no key,
-    no rate limit in practice). Returns a dict keyed by FPL's own team
-    name, mapping to a list of unavailable players.
-
-    KNOWN LIMITATION: this only covers the Premier League. La Liga,
-    Bundesliga, Serie A, Ligue 1, and UCL fixtures will get an empty
-    injuries list — Scout's existing completeness scoring already
-    handles missing injury data gracefully, so this doesn't break
-    anything, it just means those matches score lower on completeness
-    than they would with a real injury feed. No free equivalent exists
-    for the other leagues as of this writing (see prior research).
-    """
     async with httpx.AsyncClient(timeout=15) as http:
         try:
             resp = await http.get("https://fantasy.premierleague.com/api/bootstrap-static/")
@@ -353,7 +245,7 @@ async def fetch_epl_injuries() -> dict[str, list[dict]]:
     teams_by_id = {t["id"]: t["name"] for t in data.get("teams", [])}
     injuries_by_team: dict[str, list[dict]] = {}
     for player in data.get("elements", []):
-        if player.get("status") == "a":  # available — nothing to report
+        if player.get("status") == "a":
             continue
         team_name = teams_by_id.get(player.get("team"))
         if not team_name:
@@ -361,7 +253,7 @@ async def fetch_epl_injuries() -> dict[str, list[dict]]:
         injuries_by_team.setdefault(team_name, []).append(
             {
                 "player": player.get("web_name"),
-                "status": player.get("status"),  # i=injured, s=suspended, d=doubtful, u=unavailable
+                "status": player.get("status"),
                 "news": player.get("news") or "No details provided",
                 "chance_of_playing_next_round": player.get("chance_of_playing_next_round"),
             }
@@ -370,7 +262,6 @@ async def fetch_epl_injuries() -> dict[str, list[dict]]:
 
 
 def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict]:
-    """Matches a football-data.org team name to FPL's injuries dict by name."""
     target = _normalize_team_name(fd_team_name)
     for fpl_name, injuries in injuries_by_team.items():
         candidate = _normalize_team_name(FPL_NAME_ALIASES.get(fpl_name, fpl_name))
@@ -380,17 +271,6 @@ def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict
 
 
 async def fetch_weather(venue_city: str | None) -> dict:
-    """
-    Fetch weather forecast for match venue. Returns blank dict if no
-    city known.
-
-    NOTE: football-data.org's match objects don't reliably include a
-    venue city the way API-Football's did, so venue_city will often be
-    None now — this function already degrades gracefully in that case,
-    same as before, so nothing breaks. A team->home-city lookup table
-    would fix this properly; treating that as a separate follow-up
-    rather than bundling it into this provider swap.
-    """
     if not venue_city:
         logger.info("[SCOUT] No venue city available — skipping weather fetch.")
         return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
@@ -415,7 +295,6 @@ async def fetch_weather(venue_city: str | None) -> dict:
 
 
 def _extract_json(text: str) -> dict:
-    """Robustly extract a JSON object from an LLM response."""
     if not text:
         return {}
     try:
@@ -439,8 +318,8 @@ def _extract_json(text: str) -> dict:
 def analyze_with_groq(raw_data: dict) -> dict:
     """Use the LLM to structure and enrich the raw scout data."""
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        max_tokens=4096,
+        model=GROQ_MODEL,
+        max_tokens=2048,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -477,37 +356,17 @@ Return a JSON object with this structure (and nothing else):
     return result
 
 
-# Minimum matches that must reach a usable completeness score before Scout
-# stops pulling in more candidates. Mirrors the Cleaner's own bar (see
-# pipeline.py CLEANER_THRESHOLD) — both now read from the same
-# CLEANER_THRESHOLD env var (default 0.5), so Scout never stops short of
-# what the Cleaner would have accepted anyway, even during a testing run
-# that loosens the threshold.
 MIN_QUALIFYING_MATCHES = 2
 QUALIFYING_COMPLETENESS = CLEANER_THRESHOLD_ENV
-
-# Absolute ceiling on how many matches Scout will ever fully analyze in one
-# run (first batch + fallback batch combined). MUST be greater than
-# MAX_MATCHES_PER_DAY or the fallback can never actually trigger — see
-# budget note in run() for why 18 is the safe ceiling given Groq's
-# 100,000 tokens/day free limit.
 HARD_CAP_MATCHES = 18
 
 
 async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> dict:
-    """
-    Run the full injuries+weather+LLM analysis for one fixture. Odds and
-    injuries are passed in already-fetched (one call per competition,
-    made once in run()) rather than fetched here per-match — this is the
-    same "don't re-fetch per fixture" principle the old API-Football
-    version used, just applied at the competition level instead of the
-    fixture level, since that's how the new providers are shaped.
-    """
     fixture_id = fixture["id"]
     home_name = fixture["homeTeam"]["name"]
     away_name = fixture["awayTeam"]["name"]
     competition_code = fixture.get("_competition_code")
-    venue_city = None  # see fetch_weather() docstring for why
+    venue_city = None
 
     odds_snapshot = _extract_odds_snapshot(odds_event) if odds_event else {}
 
@@ -529,7 +388,6 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
     structured = analyze_with_groq(raw)
 
-    # Fallback completeness score, odds weighted lower (often post late)
     if "data_completeness" not in structured or structured.get("data_completeness") is None:
         score = 0.0
         if structured.get("home_team") and structured.get("away_team"):
@@ -556,45 +414,8 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 async def run(target_date: date | None = None) -> list[dict]:
     """
     Main scout agent entrypoint. Returns list of structured match intelligence.
-
-    Strategy:
-      1. Fetch fixtures for the target date across configured competitions
-         (football-data.org, one call per competition).
-      2. Fetch odds for each competition PRESENT in today's fixtures, in
-         ONE call per competition (The Odds API) — not per fixture.
-      3. Fetch Premier League injuries in ONE call (FPL), if PL fixtures
-         are present today. Other leagues get no injury data (see
-         fetch_epl_injuries docstring).
-      4. Match each fixture to its odds by team name, prioritize
-         odds-matched fixtures first, then run full deep analysis
-         (injuries+weather+LLM) on the best-prioritized batch of
-         MAX_MATCHES_PER_DAY. If fewer than MIN_QUALIFYING_MATCHES end up
-         with usable completeness, automatically pulls in ONE additional
-         fallback batch of FALLBACK_BATCH_SIZE from the remaining pool —
-         up to HARD_CAP_MATCHES total — rather than silently giving up.
-
-    Budget check (worst case, both batches fully used = HARD_CAP_MATCHES=18):
-      football-data.org (free tier: 10 req/min, competitions accessible
-      are the 12-competition free set):
-        - 6 calls: fixture list, one per top competition, ~1/sec spaced
-      The Odds API (free tier: 500 credits/month):
-        - up to 6 calls: one per competition PRESENT today, at
-          2 credits each (h2h + totals markets, 1 region) = up to 12
-          credits/day approximately 360/month — comfortably under the 500 cap, even
-          allowing room for occasional re-runs.
-      Fantasy Premier League API (free, no key, no practical rate limit):
-        - 1 call, only if PL fixtures are present today.
-      Groq (free tier: 100,000 tokens/day):
-        - ~2,000 tokens/match for Scout structuring x 18 = ~36,000
-        - ~1,350 tokens/match for Analyst x 18 = ~24,300
-        - ~1,050 tokens/match for Risk x 18 = ~18,900
-        - ~8,650 tokens flat for Portfolio+Auditor+Decision+Publisher
-        Total: ~87,850 tokens — under 100,000, but with less margin.
-        NOTE: this is the budget for ONE scheduled daily run. Manually
-        re-triggering the workflow multiple times on the same day (e.g.
-        for testing) can still exhaust the daily Groq quota — this was
-        observed during development testing, not a bug in the logic.
-        Model in use: openai/gpt-oss-120b (replaces deprecated openai/gpt-oss-120b)
+    Model: llama-3.1-8b-instant (20,000 TPM free tier — replaces openai/gpt-oss-120b which had only 8,000 TPM).
+    Call delay: 6s between fixture analyses to stay safely under rate limits.
     """
     target_date = target_date or date.today()
     league_names = list(TOP_LEAGUE_IDS.values())
@@ -621,9 +442,6 @@ async def run(target_date: date | None = None) -> list[dict]:
     if "PL" in codes_present:
         epl_injuries = await fetch_epl_injuries()
 
-    # Match each fixture to its odds event (if any), and prioritize
-    # odds-matched fixtures first — same reasoning as before: they're
-    # far more likely to yield a complete analysis.
     scanned = []
     for fixture in fixtures:
         events = odds_by_league.get(fixture["_competition_code"], [])
@@ -634,11 +452,8 @@ async def run(target_date: date | None = None) -> list[dict]:
     without_odds = [(f, o) for f, o in scanned if not o]
     prioritized = with_odds + without_odds
 
-    logger.info(
-        f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds. Prioritizing those first."
-    )
+    logger.info(f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds. Prioritizing those first.")
 
-    # Deep analysis — first batch, then fallback if needed
     results: list[dict] = []
     cursor = 0
     is_first_batch = True
@@ -657,7 +472,7 @@ async def run(target_date: date | None = None) -> list[dict]:
         for fixture, odds_event in batch:
             structured = await _deep_analyze(fixture, odds_event, epl_injuries)
             results.append(structured)
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(GROQ_CALL_DELAY_SECONDS)
 
         qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
         logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
@@ -673,8 +488,7 @@ async def run(target_date: date | None = None) -> list[dict]:
             )
         else:
             logger.info(
-                f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget "
-                f"remaining to pull further batches."
+                f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget remaining."
             )
 
     logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages total.")
