@@ -14,7 +14,7 @@ import httpx
 from groq import Groq
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=8)
 
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
@@ -266,7 +266,7 @@ def _get_venue_city(home_team_name: str) -> str | None:
 
 # Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier.
 GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_CALL_DELAY_SECONDS = 6
+GROQ_CALL_DELAY_SECONDS = 12
 
 
 def _load_league_ids() -> dict[str, str]:
@@ -590,8 +590,23 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
     weather = await fetch_weather(venue_city)
 
+    # Send only the fields the SYSTEM_PROMPT actually needs. The raw
+    # football-data.org fixture includes crest URLs, referee lists, and
+    # other verbose metadata that costs prompt tokens without adding
+    # anything the model uses — trimming this meaningfully reduces load
+    # against gpt-oss-20b's tight 8,000 TPM ceiling.
+    fixture_trimmed = {
+        "id": fixture.get("id"),
+        "utcDate": fixture.get("utcDate"),
+        "status": fixture.get("status"),
+        "matchday": fixture.get("matchday"),
+        "homeTeam": {"name": home_name},
+        "awayTeam": {"name": away_name},
+        "competition": KNOWN_LEAGUE_NAMES.get(competition_code, competition_code),
+    }
+
     raw = {
-        "fixture": fixture,
+        "fixture": fixture_trimmed,
         "odds": odds_snapshot,
         "home_injuries": home_injuries,
         "away_injuries": away_injuries,
