@@ -1,23 +1,6 @@
 """
 SCOUT AGENT — Football Pulse AI (GitHub Actions edition)
 Pulls fixtures, odds, form, injuries, lineups, weather, travel, market movement.
-
-Filters to top European leagues for better data quality/completeness.
-
-Data sources (as of this version):
-  - Fixtures:   football-data.org v4 (free tier, current season, no season-year guessing)
-  - Odds:       The Odds API (free tier, 500 credits/month — one call per
-                competition returns odds for every fixture in it)
-  - Injuries:   Official Fantasy Premier League API — Premier League only.
-                Other leagues get an empty injuries list; this is a known
-                gap, not a bug (see fetch_epl_injuries docstring).
-  - Weather:    OpenWeatherMap, unchanged from before.
-
-Uses a two-pass strategy: fetch odds for every fixture in a competition in
-ONE call, match each fixture to its odds by team name, then run full deep
-analysis (odds+injuries+weather+LLM) on odds-matched fixtures first —
-automatically pulling in more matches if too few pass the quality bar,
-rather than being stuck with whatever the API happened to return first.
 """
 
 import asyncio
@@ -71,12 +54,218 @@ FPL_NAME_ALIASES = {
     "Wolves": "Wolverhampton Wanderers",
 }
 
-# Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier,
-# which is enough headroom for back-to-back fixture analyses without 429s.
-GROQ_MODEL = "llama-3.1-8b-instant"
+# ─────────────────────────────────────────────────────────────────────────────
+# Home city lookup — used when football-data.org doesn't return a venue city.
+# Keys are lowercased team name fragments so partial matches work too.
+# ─────────────────────────────────────────────────────────────────────────────
+TEAM_HOME_CITY: dict[str, str] = {
+    # Premier League
+    "arsenal": "London",
+    "chelsea": "London",
+    "tottenham": "London",
+    "spurs": "London",
+    "west ham": "London",
+    "crystal palace": "London",
+    "fulham": "London",
+    "brentford": "London",
+    "wimbledon": "London",
+    "charlton": "London",
+    "millwall": "London",
+    "manchester city": "Manchester",
+    "manchester united": "Manchester",
+    "liverpool": "Liverpool",
+    "everton": "Liverpool",
+    "newcastle": "Newcastle upon Tyne",
+    "sunderland": "Sunderland",
+    "aston villa": "Birmingham",
+    "birmingham": "Birmingham",
+    "wolverhampton": "Wolverhampton",
+    "wolves": "Wolverhampton",
+    "west bromwich": "West Bromwich",
+    "leicester": "Leicester",
+    "nottingham": "Nottingham",
+    "derby": "Derby",
+    "sheffield united": "Sheffield",
+    "sheffield wednesday": "Sheffield",
+    "leeds": "Leeds",
+    "burnley": "Burnley",
+    "bolton": "Bolton",
+    "blackburn": "Blackburn",
+    "brighton": "Brighton",
+    "southampton": "Southampton",
+    "portsmouth": "Portsmouth",
+    "watford": "Watford",
+    "luton": "Luton",
+    "norwich": "Norwich",
+    "ipswich": "Ipswich",
+    "coventry": "Coventry",
+    "stoke": "Stoke-on-Trent",
+    "middlesbrough": "Middlesbrough",
+    "swansea": "Swansea",
+    "cardiff": "Cardiff",
+    # La Liga
+    "real madrid": "Madrid",
+    "atletico madrid": "Madrid",
+    "atletico de madrid": "Madrid",
+    "getafe": "Madrid",
+    "rayo vallecano": "Madrid",
+    "barcelona": "Barcelona",
+    "espanyol": "Barcelona",
+    "valencia": "Valencia",
+    "villarreal": "Villarreal",
+    "sevilla": "Seville",
+    "real betis": "Seville",
+    "athletic bilbao": "Bilbao",
+    "athletic club": "Bilbao",
+    "real sociedad": "San Sebastian",
+    "osasuna": "Pamplona",
+    "deportivo alaves": "Vitoria-Gasteiz",
+    "alaves": "Vitoria-Gasteiz",
+    "celta vigo": "Vigo",
+    "malaga": "Malaga",
+    "granada": "Granada",
+    "real valladolid": "Valladolid",
+    "cadiz": "Cadiz",
+    "almeria": "Almeria",
+    "girona": "Girona",
+    "las palmas": "Las Palmas",
+    "leganes": "Leganes",
+    # Bundesliga
+    "bayern munich": "Munich",
+    "fc bayern": "Munich",
+    "borussia dortmund": "Dortmund",
+    "bvb": "Dortmund",
+    "rb leipzig": "Leipzig",
+    "bayer leverkusen": "Leverkusen",
+    "borussia monchengladbach": "Monchengladbach",
+    "eintracht frankfurt": "Frankfurt",
+    "sc freiburg": "Freiburg",
+    "vfb stuttgart": "Stuttgart",
+    "stuttgar": "Stuttgart",
+    "wolfsburg": "Wolfsburg",
+    "werder bremen": "Bremen",
+    "hamburger": "Hamburg",
+    "hertha berlin": "Berlin",
+    "union berlin": "Berlin",
+    "schalke": "Gelsenkirchen",
+    "augsburg": "Augsburg",
+    "mainz": "Mainz",
+    "hoffenheim": "Sinsheim",
+    "koln": "Cologne",
+    "fc koln": "Cologne",
+    "cologne": "Cologne",
+    "heidenheim": "Heidenheim",
+    "darmstadt": "Darmstadt",
+    # Serie A
+    "juventus": "Turin",
+    "torino": "Turin",
+    "ac milan": "Milan",
+    "inter milan": "Milan",
+    "internazionale": "Milan",
+    "como": "Como",
+    "as roma": "Rome",
+    "lazio": "Rome",
+    "napoli": "Naples",
+    "atalanta": "Bergamo",
+    "fiorentina": "Florence",
+    "bologna": "Bologna",
+    "genoa": "Genoa",
+    "sampdoria": "Genoa",
+    "udinese": "Udine",
+    "cagliari": "Cagliari",
+    "sassuolo": "Sassuolo",
+    "empoli": "Empoli",
+    "lecce": "Lecce",
+    "frosinone": "Frosinone",
+    "monza": "Monza",
+    "hellas verona": "Verona",
+    "venezia": "Venice",
+    "parma": "Parma",
+    # Ligue 1
+    "psg": "Paris",
+    "paris saint-germain": "Paris",
+    "paris saint germain": "Paris",
+    "olympique de marseille": "Marseille",
+    "marseille": "Marseille",
+    "olympique lyonnais": "Lyon",
+    "lyon": "Lyon",
+    "monaco": "Monaco",
+    "nice": "Nice",
+    "stade rennais": "Rennes",
+    "rennes": "Rennes",
+    "lille": "Lille",
+    "montpellier": "Montpellier",
+    "nantes": "Nantes",
+    "strasbourg": "Strasbourg",
+    "toulouse": "Toulouse",
+    "reims": "Reims",
+    "lens": "Lens",
+    "brest": "Brest",
+    "auxerre": "Auxerre",
+    "angers": "Angers",
+    "le havre": "Le Havre",
+    "clermont": "Clermont-Ferrand",
+    "metz": "Metz",
+    "lorient": "Lorient",
+    "saint-etienne": "Saint-Etienne",
+    # Eredivisie
+    "ajax": "Amsterdam",
+    "psv": "Eindhoven",
+    "feyenoord": "Rotterdam",
+    "az alkmaar": "Alkmaar",
+    "az": "Alkmaar",
+    "vitesse": "Arnhem",
+    "utrecht": "Utrecht",
+    "twente": "Enschede",
+    # Primeira Liga
+    "benfica": "Lisbon",
+    "sporting cp": "Lisbon",
+    "porto": "Porto",
+    "braga": "Braga",
+    "vitoria guimaraes": "Guimaraes",
+    # World Cup / international — use host city where known
+    "united states": "New York",
+    "usa": "New York",
+    "mexico": "Mexico City",
+    "canada": "Toronto",
+    "brazil": "Rio de Janeiro",
+    "argentina": "Buenos Aires",
+    "germany": "Berlin",
+    "france": "Paris",
+    "england": "London",
+    "spain": "Madrid",
+    "italy": "Rome",
+    "portugal": "Lisbon",
+    "netherlands": "Amsterdam",
+    "belgium": "Brussels",
+    "morocco": "Casablanca",
+    "senegal": "Dakar",
+    "nigeria": "Lagos",
+    "egypt": "Cairo",
+    "japan": "Tokyo",
+    "south korea": "Seoul",
+    "australia": "Sydney",
+}
 
-# Seconds to wait between consecutive Groq calls inside the fixture loop.
-# 6s gives ~10 calls/min, well under the 30 RPM free-tier cap.
+
+def _get_venue_city(home_team_name: str) -> str | None:
+    """
+    Look up a home city for the given team name using the TEAM_HOME_CITY table.
+    Uses case-insensitive substring matching so partial names work too.
+    """
+    name_lower = home_team_name.lower().strip()
+    # Try exact match first
+    if name_lower in TEAM_HOME_CITY:
+        return TEAM_HOME_CITY[name_lower]
+    # Try substring match
+    for key, city in TEAM_HOME_CITY.items():
+        if key in name_lower or name_lower in key:
+            return city
+    return None
+
+
+# Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier.
+GROQ_MODEL = "llama-3.1-8b-instant"
 GROQ_CALL_DELAY_SECONDS = 6
 
 
@@ -272,25 +461,34 @@ def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict
 
 async def fetch_weather(venue_city: str | None) -> dict:
     if not venue_city:
-        logger.info("[SCOUT] No venue city available — skipping weather fetch.")
+        logger.info("[SCOUT] No venue city — skipping weather fetch.")
         return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
 
     async with httpx.AsyncClient(timeout=10) as http:
         try:
             resp = await http.get(
                 "https://api.openweathermap.org/data/2.5/weather",
-                params={"q": venue_city, "appid": os.environ.get("OPENWEATHER_KEY", ""), "units": "metric"},
+                params={
+                    "q": venue_city,
+                    "appid": os.environ.get("OPENWEATHER_KEY", ""),
+                    "units": "metric",
+                },
             )
             resp.raise_for_status()
             data = resp.json()
-            return {
+            weather = {
                 "temp_c": data["main"]["temp"],
-                "wind_kmh": data["wind"]["speed"] * 3.6,
+                "wind_kmh": round(data["wind"]["speed"] * 3.6, 1),
                 "rain_probability": data.get("rain", {}).get("1h", 0),
                 "conditions": data["weather"][0]["description"],
             }
+            logger.info(
+                f"[SCOUT] Weather for {venue_city}: {weather['conditions']}, "
+                f"{weather['temp_c']}°C, wind {weather['wind_kmh']} km/h"
+            )
+            return weather
         except Exception as e:
-            logger.warning(f"Weather fetch failed for {venue_city}: {e}")
+            logger.warning(f"[SCOUT] Weather fetch failed for {venue_city}: {e}")
             return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
 
 
@@ -316,7 +514,6 @@ def _extract_json(text: str) -> dict:
 
 
 def analyze_with_groq(raw_data: dict) -> dict:
-    """Use the LLM to structure and enrich the raw scout data."""
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         max_tokens=2048,
@@ -366,7 +563,18 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
     home_name = fixture["homeTeam"]["name"]
     away_name = fixture["awayTeam"]["name"]
     competition_code = fixture.get("_competition_code")
-    venue_city = None
+
+    # Try to get venue city from the API response first,
+    # then fall back to our home-team lookup table.
+    venue_city = (
+        fixture.get("venue")
+        or fixture.get("homeTeam", {}).get("venue")
+        or _get_venue_city(home_name)
+    )
+    if venue_city:
+        logger.info(f"[SCOUT] Venue city for {home_name}: {venue_city}")
+    else:
+        logger.info(f"[SCOUT] No venue city found for {home_name} — skipping weather.")
 
     odds_snapshot = _extract_odds_snapshot(odds_event) if odds_event else {}
 
@@ -384,6 +592,7 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
         "home_injuries": home_injuries,
         "away_injuries": away_injuries,
         "weather": weather,
+        "venue_city": venue_city,
     }
 
     structured = analyze_with_groq(raw)
@@ -413,9 +622,9 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
 async def run(target_date: date | None = None) -> list[dict]:
     """
-    Main scout agent entrypoint. Returns list of structured match intelligence.
-    Model: llama-3.1-8b-instant (20,000 TPM free tier — replaces openai/gpt-oss-120b which had only 8,000 TPM).
-    Call delay: 6s between fixture analyses to stay safely under rate limits.
+    Main scout agent entrypoint.
+    Model: llama-3.1-8b-instant (20,000 TPM free tier).
+    Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
     """
     target_date = target_date or date.today()
     league_names = list(TOP_LEAGUE_IDS.values())
