@@ -321,8 +321,7 @@ Return JSON:
                 f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
                 f"(len={len(text or '')}): {text[:300]!r}"
             )
-        if i < len(clean_matches) - 1:
-            time.sleep(GROQ_CALL_DELAY_SECONDS)
+        time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
 
 
@@ -361,8 +360,7 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
                 f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
                 f"— model_confidence={prob.get('model_confidence')} — {risk_data.get('rejection_reason')}"
             )
-        if i < len(probabilities) - 1:
-            time.sleep(GROQ_CALL_DELAY_SECONDS)
+        time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
@@ -383,6 +381,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             }
         ]
     )
+    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
@@ -459,6 +458,7 @@ def run_auditor(portfolio: dict) -> dict:
             }
         ]
     )
+    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
@@ -486,6 +486,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
             }
         ]
     )
+    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
