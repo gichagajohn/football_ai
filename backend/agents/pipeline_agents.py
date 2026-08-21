@@ -12,13 +12,15 @@ from typing import Any
 from groq import Groq
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=8)
 
 # Model: llama-3.1-8b-instant — 20,000 TPM free tier, avoids 429s from openai/gpt-oss-120b (8,000 TPM)
 GROQ_MODEL = "openai/gpt-oss-20b"
 
-# 6s between calls keeps us well under Groq's 30 RPM free-tier cap
-GROQ_CALL_DELAY_SECONDS = 6
+# openai/gpt-oss-20b's real ceiling is 8,000 TPM (tokens/minute), shared across
+# the whole pipeline — much tighter than the RPM cap. 12s between calls keeps
+# us comfortably under it; max_retries=8 on the client absorbs the rest.
+GROQ_CALL_DELAY_SECONDS = 12
 
 JSON_RULES = """
 
