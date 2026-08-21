@@ -14,9 +14,7 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Model: openai/gpt-oss-20b — Groq's recommended replacement for the retired
-# llama-3.1-8b-instant (deprecated, shut down 08/16/26). Kept as the 20b
-# variant rather than gpt-oss-120b to preserve headroom on free-tier TPM limits.
+# Model: llama-3.1-8b-instant — 20,000 TPM free tier, avoids 429s from openai/gpt-oss-120b (8,000 TPM)
 GROQ_MODEL = "openai/gpt-oss-20b"
 
 # 6s between calls keeps us well under Groq's 30 RPM free-tier cap
@@ -312,8 +310,15 @@ Return JSON:
             data["odds_snapshot"] = match.get("odds_snapshot", {})
             data["league"] = match.get("league")
             probabilities.append(data)
+            logger.info(
+                f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
+                f"— model_confidence={data.get('model_confidence')}"
+            )
         else:
-            logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
+            logger.error(
+                f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
+                f"(len={len(text or '')}): {text[:300]!r}"
+            )
         if i < len(clean_matches) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
@@ -325,7 +330,8 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
         response = client.chat.completions.create(
             model=GROQ_MODEL,
-            max_tokens=600,
+            max_tokens=1200,
+            reasoning_effort="low",
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
                 {
@@ -337,12 +343,22 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         text = response.choices[0].message.content
         risk_data = _extract_json(text)
         if not risk_data:
-            logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
+            logger.error(
+                f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"(len={len(text or '')}): {text[:300]!r}"
+            )
         elif risk_data.get("approved"):
             prob["risk_assessment"] = risk_data
             safe.append(prob)
+            logger.info(
+                f"[RISK] Approved: {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"— risk_level={risk_data.get('risk_level')}"
+            )
         else:
-            logger.info(f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} — {risk_data.get('rejection_reason')}")
+            logger.info(
+                f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"— model_confidence={prob.get('model_confidence')} — {risk_data.get('rejection_reason')}"
+            )
         if i < len(probabilities) - 1:
             time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
@@ -458,7 +474,8 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
-        max_tokens=400,
+        max_tokens=900,
+        reasoning_effort="low",
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
             {
@@ -470,7 +487,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
-        logger.error(f"Decision parse error: {text[:200]}")
+        logger.error(f"Decision parse error (len={len(text or '')}): {text[:300]!r}")
         return {"decision": "NO_BET", "reason": "Decision agent error — defaulting safe.", "final_confidence": 0.0}
 
     final_confidence = data.get("final_confidence")
