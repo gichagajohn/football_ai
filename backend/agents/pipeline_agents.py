@@ -14,8 +14,10 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Model: llama-3.1-8b-instant — 20,000 TPM free tier, avoids 429s from openai/gpt-oss-120b (8,000 TPM)
-GROQ_MODEL = "llama-3.1-8b-instant"
+# Model: openai/gpt-oss-20b — Groq's recommended replacement for the retired
+# llama-3.1-8b-instant (deprecated, shut down 08/16/26). Kept as the 20b
+# variant rather than gpt-oss-120b to preserve headroom on free-tier TPM limits.
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 # 6s between calls keeps us well under Groq's 30 RPM free-tier cap
 GROQ_CALL_DELAY_SECONDS = 6
