@@ -264,8 +264,9 @@ def _get_venue_city(home_team_name: str) -> str | None:
     return None
 
 
-# Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier.
-GROQ_MODEL = "llama-3.1-8b-instant"
+# Model in use — llama-3.1-8b-instant was deprecated by Groq on 08/16/26.
+# openai/gpt-oss-20b is Groq's official recommended replacement.
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_CALL_DELAY_SECONDS = 6
 
 
@@ -623,7 +624,7 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 async def run(target_date: date | None = None) -> list[dict]:
     """
     Main scout agent entrypoint.
-    Model: llama-3.1-8b-instant (20,000 TPM free tier).
+    Model: openai/gpt-oss-20b (Groq's replacement for the retired llama-3.1-8b-instant).
     Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
     """
     target_date = target_date or date.today()
