@@ -264,8 +264,7 @@ def _get_venue_city(home_team_name: str) -> str | None:
     return None
 
 
-# Model in use — llama-3.1-8b-instant was deprecated by Groq on 08/16/26.
-# openai/gpt-oss-20b is Groq's official recommended replacement.
+# Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier.
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_CALL_DELAY_SECONDS = 6
 
@@ -517,7 +516,8 @@ def _extract_json(text: str) -> dict:
 def analyze_with_groq(raw_data: dict) -> dict:
     response = client.chat.completions.create(
         model=GROQ_MODEL,
-        max_tokens=2048,
+        max_tokens=3072,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -550,7 +550,10 @@ Return a JSON object with this structure (and nothing else):
     text = response.choices[0].message.content
     result = _extract_json(text)
     if not result:
-        logger.error(f"[SCOUT] Failed to parse LLM response as JSON: {text[:200]}")
+        logger.error(
+            f"[SCOUT] Failed to parse LLM response as JSON (len={len(text)}). "
+            f"Start: {text[:300]!r} ... End: {text[-300:]!r}"
+        )
     return result
 
 
@@ -597,6 +600,14 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
     }
 
     structured = analyze_with_groq(raw)
+
+    # Never let a parsing failure erase the match's identity. These come
+    # straight from football-data.org, not the LLM, so they're always
+    # trustworthy — backfill them even if analyze_with_groq() returned {}.
+    structured.setdefault("home_team", home_name)
+    structured.setdefault("away_team", away_name)
+    structured.setdefault("league", KNOWN_LEAGUE_NAMES.get(competition_code, competition_code))
+    structured.setdefault("kickoff_utc", fixture.get("utcDate"))
 
     if "data_completeness" not in structured or structured.get("data_completeness") is None:
         score = 0.0
