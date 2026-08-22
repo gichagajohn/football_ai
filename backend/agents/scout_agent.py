@@ -716,18 +716,177 @@ Given raw data from APIs and web sources, you:
 5. Assess weather risk (heavy rain, wind >50km/h, extreme cold)
 6. Note lineup status as informational only (expected to be unconfirmed
    at this stage — this is not itself a red flag)
+7. Report recent form / head-to-head / standings using ONLY the real
+   figures provided to you under "recent_form", "head_to_head", and
+   "standings" in the raw data. These come from a real stats API, not
+   from you. Copy/summarize them faithfully. If a field arrives as an
+   empty object {{}}, that means the data genuinely was not available —
+   report it as 'UNKNOWN', do NOT invent a plausible-looking form string,
+   H2H record, or league position to fill the gap. A form field you did
+   not compute from the supplied data is a hallucination, full stop.
 
 IMPORTANT OUTPUT RULES:
 - Respond with ONLY the JSON object. No markdown code fences, no commentary, no explanation before or after.
 - data_completeness must be a float between 0.0 and 1.0 reflecting how much real data you actually received
-  (team names, odds present, injury reports present, weather present). Do NOT penalize completeness for
-  lineups being unconfirmed — that's expected at this stage, not missing data. If odds/injuries/weather
-  are genuinely missing/UNKNOWN, data_completeness should be LOW (e.g. 0.3-0.5); lineup status has no
-  bearing on this score.
-- Never hallucinate injury or lineup data — if unknown, state 'UNKNOWN'."""
+  (team names, odds present, injury reports present, weather present, recent_form/head_to_head/standings
+  present and non-empty). Do NOT penalize completeness for lineups being unconfirmed — that's expected at
+  this stage, not missing data. If odds/injuries/weather/form/H2H/standings are genuinely missing/UNKNOWN,
+  data_completeness should be LOW (e.g. 0.3-0.5); lineup status has no bearing on this score.
+- Never hallucinate injury, lineup, form, head-to-head, or standings data — if unknown, state 'UNKNOWN'."""
 
 
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real form / head-to-head / standings data.
+#
+# Previously NOTHING in this file fetched actual recent-form, head-to-head,
+# or standings data — yet SYSTEM_PROMPT told the LLM to ground its analysis
+# in "recent form (last 5 results)" and "head-to-head record", and the
+# requested output schema has a "form" field. With no real data behind it,
+# the model had no choice but to invent plausible-sounding form/H2H for
+# every match, in every league. That's very likely why Analyst confidence
+# clustered so tightly around 0.65 across genuinely different matchups —
+# there was no real signal to differentiate on.
+#
+# These three endpoints (all on football-data.org, using the same
+# FOOTBALL_DATA_KEY already configured) provide the real data:
+#   - /teams/{id}/matches?status=FINISHED&limit=5  -> last-5 results
+#   - /matches/{id}/head2head?limit=10             -> real H2H record
+#   - /competitions/{code}/standings                -> league position/points
+#
+# ENABLE_REAL_FORM_DATA=false skips all three (e.g. if the extra API load
+# is too slow or the free-tier quota is too tight) — in that case the raw
+# data passed to the LLM is explicitly {} for these fields, and
+# SYSTEM_PROMPT instructs it to report "UNKNOWN" rather than invent
+# something, which is strictly more honest than the old behavior either way.
+ENABLE_REAL_FORM_DATA = os.environ.get("ENABLE_REAL_FORM_DATA", "true").strip().lower() != "false"
+
+# football-data.org's free tier is rate-limited (historically ~10 req/min).
+# Fetching form/H2H/standings adds real extra calls on top of fixtures/odds,
+# so we pace them with a simple minimum-interval limiter rather than trusting
+# them not to 429. Raise via env if you're on a paid tier with a higher cap.
+FOOTBALL_DATA_MIN_INTERVAL_SECONDS = _float_env("FOOTBALL_DATA_MIN_INTERVAL_SECONDS", 6.5)
+_fd_last_request_time = 0.0
+
+
+async def _fd_pace() -> None:
+    """Sleep just enough to keep football-data.org calls at or under
+    FOOTBALL_DATA_MIN_INTERVAL_SECONDS apart. Applied to the new
+    form/H2H/standings endpoints; the original fixtures loop keeps its own
+    existing per-competition sleep(1) unchanged."""
+    global _fd_last_request_time
+    now = time.time()
+    wait = FOOTBALL_DATA_MIN_INTERVAL_SECONDS - (now - _fd_last_request_time)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _fd_last_request_time = time.time()
+
+
+async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dict[int, dict]:
+    """Returns {team_id: {"position", "points", "played", "goal_diff"}} for
+    the given competition's current TOTAL table. Empty dict on any failure —
+    callers must treat a missing team as UNKNOWN, not assume last place."""
+    await _fd_pace()
+    try:
+        resp = await http.get(
+            f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/standings",
+            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"[SCOUT] Standings fetch failed for {competition_code}: {e}")
+        return {}
+
+    table_map: dict[int, dict] = {}
+    for group in data.get("standings", []):
+        if group.get("type") != "TOTAL":
+            continue
+        for row in group.get("table", []):
+            team_id = row.get("team", {}).get("id")
+            if team_id is None:
+                continue
+            table_map[team_id] = {
+                "position": row.get("position"),
+                "points": row.get("points"),
+                "played": row.get("playedGames"),
+                "goal_diff": row.get("goalDifference"),
+            }
+    return table_map
+
+
+async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
+    """Returns {"results": "WLDWW" (most recent first), "matches_considered",
+    "goals_for", "goals_against"} from the team's last 5 FINISHED matches
+    across all competitions. Empty dict on any failure or if no finished
+    matches are found — callers must treat that as UNKNOWN, not "0 wins"."""
+    await _fd_pace()
+    try:
+        resp = await http.get(
+            f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
+            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
+            params={"status": "FINISHED", "limit": 5},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"[SCOUT] Recent-form fetch failed for team {team_id}: {e}")
+        return {}
+
+    results = []
+    goals_for = 0
+    goals_against = 0
+    for m in data.get("matches", [])[:5]:
+        full_time = m.get("score", {}).get("fullTime", {})
+        home_goals, away_goals = full_time.get("home"), full_time.get("away")
+        if home_goals is None or away_goals is None:
+            continue
+        is_home = m.get("homeTeam", {}).get("id") == team_id
+        gf, ga = (home_goals, away_goals) if is_home else (away_goals, home_goals)
+        goals_for += gf
+        goals_against += ga
+        results.append("W" if gf > ga else "L" if gf < ga else "D")
+
+    if not results:
+        return {}
+    return {
+        "results": "".join(results),
+        "matches_considered": len(results),
+        "goals_for": goals_for,
+        "goals_against": goals_against,
+    }
+
+
+async def fetch_head_to_head(http: httpx.AsyncClient, fixture_id: int) -> dict:
+    """Returns {"matches_played", "home_wins", "draws", "away_wins"} from the
+    real head-to-head aggregate for this exact fixture (last 10 meetings).
+    Empty dict on any failure — callers must treat that as UNKNOWN, not
+    "no history"."""
+    await _fd_pace()
+    try:
+        resp = await http.get(
+            f"{FOOTBALL_DATA_BASE}/matches/{fixture_id}/head2head",
+            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
+            params={"limit": 10},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning(f"[SCOUT] Head-to-head fetch failed for fixture {fixture_id}: {e}")
+        return {}
+
+    agg = data.get("aggregates", {})
+    if not agg:
+        return {}
+    home = agg.get("homeTeam", {})
+    away = agg.get("awayTeam", {})
+    return {
+        "matches_played": agg.get("numberOfMatches"),
+        "home_wins": home.get("wins"),
+        "draws": home.get("draws"),
+        "away_wins": away.get("wins"),
+    }
 
 
 async def fetch_fixtures(target_date: date) -> list[dict]:
@@ -942,7 +1101,10 @@ Return a JSON object with this structure (and nothing else):
   "away_team": str,
   "league": str,
   "kickoff_utc": str,
-  "form": {{"home": [...], "away": [...]}},
+  "form": {{"home": str, "away": str}},
+  "form_source": "real|UNKNOWN",
+  "head_to_head": {{"record": str, "matches_played": int}},
+  "standings_gap": {{"home_position": int, "away_position": int, "points_gap": int}},
   "injuries": {{"home": [...], "away": [...]}},
   "odds_snapshot": {{"home_win": float, "draw": float, "away_win": float, "btts_yes": float, "over25": float}},
   "odds_movement": str,
@@ -977,11 +1139,20 @@ QUALIFYING_COMPLETENESS = CLEANER_THRESHOLD_ENV
 HARD_CAP_MATCHES = 18
 
 
-async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> dict:
+async def _deep_analyze(
+    fixture: dict,
+    odds_event: dict,
+    epl_injuries: dict,
+    fd_http: httpx.AsyncClient,
+    standings_cache: dict[str, dict],
+    team_form_cache: dict[int, dict],
+) -> dict:
     fixture_id = fixture["id"]
     home_name = fixture["homeTeam"]["name"]
     away_name = fixture["awayTeam"]["name"]
     competition_code = fixture.get("_competition_code")
+    home_id = fixture.get("homeTeam", {}).get("id")
+    away_id = fixture.get("awayTeam", {}).get("id")
 
     # Try to get venue city from the API response first,
     # then fall back to our home-team lookup table.
@@ -1005,6 +1176,30 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
     weather = await fetch_weather(venue_city)
 
+    # Real recent-form / head-to-head / standings data (see the comment
+    # block above FOOTBALL_DATA_BASE for why this exists at all: previously
+    # nothing fetched this, and the LLM was inventing it wholesale). Cached
+    # per team/competition across the whole run so a team appearing in
+    # multiple fixtures, or a competition with several fixtures today,
+    # doesn't refetch the same data repeatedly.
+    if ENABLE_REAL_FORM_DATA:
+        if competition_code and competition_code not in standings_cache:
+            standings_cache[competition_code] = await fetch_standings(fd_http, competition_code)
+        standings = standings_cache.get(competition_code, {}) if competition_code else {}
+        home_standing = standings.get(home_id, {}) if home_id is not None else {}
+        away_standing = standings.get(away_id, {}) if away_id is not None else {}
+
+        if home_id is not None and home_id not in team_form_cache:
+            team_form_cache[home_id] = await fetch_team_recent_form(fd_http, home_id)
+        if away_id is not None and away_id not in team_form_cache:
+            team_form_cache[away_id] = await fetch_team_recent_form(fd_http, away_id)
+        home_form = team_form_cache.get(home_id, {}) if home_id is not None else {}
+        away_form = team_form_cache.get(away_id, {}) if away_id is not None else {}
+
+        head_to_head = await fetch_head_to_head(fd_http, fixture_id)
+    else:
+        home_standing = away_standing = home_form = away_form = head_to_head = {}
+
     raw = {
         "fixture": fixture,
         "odds": odds_snapshot,
@@ -1012,6 +1207,11 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
         "away_injuries": away_injuries,
         "weather": weather,
         "venue_city": venue_city,
+        # Real data, or {} meaning genuinely UNKNOWN — SYSTEM_PROMPT
+        # instructs the model these are never to be invented.
+        "recent_form": {"home": home_form, "away": away_form},
+        "head_to_head": head_to_head,
+        "standings": {"home": home_standing, "away": away_standing},
     }
 
     structured = analyze_with_groq(raw)
@@ -1030,12 +1230,16 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
     if "data_completeness" not in structured or structured.get("data_completeness") is None:
         score = 0.0
         if structured.get("home_team") and structured.get("away_team"):
-            score += 0.4
-        if home_injuries or away_injuries:
             score += 0.3
+        if home_injuries or away_injuries:
+            score += 0.2
         if odds_snapshot:
             score += 0.2
         if weather.get("temp_c") is not None:
+            score += 0.1
+        if home_form or away_form:
+            score += 0.1
+        if head_to_head:
             score += 0.1
         structured["data_completeness"] = round(score, 2)
 
@@ -1096,39 +1300,50 @@ async def run(target_date: date | None = None) -> list[dict]:
     cursor = 0
     is_first_batch = True
 
-    while cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
-        batch_size = MAX_MATCHES_PER_DAY if is_first_batch else FALLBACK_BATCH_SIZE
-        remaining_budget = HARD_CAP_MATCHES - len(results)
-        batch_size = min(batch_size, remaining_budget)
+    # Caches live for the whole run: a team appearing in more than one
+    # fixture today, or a competition with several fixtures, only needs
+    # its standings/form fetched once. fd_http is a single shared client so
+    # the new football-data.org calls (standings/form/head2head) reuse
+    # connections instead of opening one per request.
+    standings_cache: dict[str, dict] = {}
+    team_form_cache: dict[int, dict] = {}
 
-        batch = prioritized[cursor:cursor + batch_size]
-        cursor += batch_size
-        is_first_batch = False
+    async with httpx.AsyncClient(timeout=20) as fd_http:
+        while cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
+            batch_size = MAX_MATCHES_PER_DAY if is_first_batch else FALLBACK_BATCH_SIZE
+            remaining_budget = HARD_CAP_MATCHES - len(results)
+            batch_size = min(batch_size, remaining_budget)
 
-        logger.info(f"[SCOUT] Analyzing batch of {len(batch)} fixture(s) (processed so far: {len(results)})...")
+            batch = prioritized[cursor:cursor + batch_size]
+            cursor += batch_size
+            is_first_batch = False
 
-        for fixture, odds_event in batch:
-            structured = await _deep_analyze(fixture, odds_event, epl_injuries)
-            results.append(structured)
-            # No fixed sleep here anymore — analyze_with_groq's _groq_chat call
-            # already paces itself against the real rolling TPM budget.
+            logger.info(f"[SCOUT] Analyzing batch of {len(batch)} fixture(s) (processed so far: {len(results)})...")
 
-        qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
-        logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
+            for fixture, odds_event in batch:
+                structured = await _deep_analyze(
+                    fixture, odds_event, epl_injuries, fd_http, standings_cache, team_form_cache
+                )
+                results.append(structured)
+                # No fixed sleep here anymore — analyze_with_groq's _groq_chat call
+                # already paces itself against the real rolling TPM budget.
 
-        if qualifying >= MIN_QUALIFYING_MATCHES:
-            logger.info("[SCOUT] Enough qualifying matches found — stopping further batches.")
-            break
+            qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
+            logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
 
-        if cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
-            logger.info(
-                f"[SCOUT] Only {qualifying} qualifying match(es) so far (need {MIN_QUALIFYING_MATCHES}). "
-                f"Pulling one fallback batch automatically..."
-            )
-        else:
-            logger.info(
-                f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget remaining."
-            )
+            if qualifying >= MIN_QUALIFYING_MATCHES:
+                logger.info("[SCOUT] Enough qualifying matches found — stopping further batches.")
+                break
+
+            if cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
+                logger.info(
+                    f"[SCOUT] Only {qualifying} qualifying match(es) so far (need {MIN_QUALIFYING_MATCHES}). "
+                    f"Pulling one fallback batch automatically..."
+                )
+            else:
+                logger.info(
+                    f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget remaining."
+                )
 
     logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages total.")
     return results
