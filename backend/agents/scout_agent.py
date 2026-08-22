@@ -769,6 +769,16 @@ ENABLE_REAL_FORM_DATA = os.environ.get("ENABLE_REAL_FORM_DATA", "true").strip().
 FOOTBALL_DATA_MIN_INTERVAL_SECONDS = _float_env("FOOTBALL_DATA_MIN_INTERVAL_SECONDS", 6.5)
 _fd_last_request_time = 0.0
 
+# How many times to retry a single football-data.org call on a 429 before
+# giving up and returning {} (UNKNOWN) for that one field. The previous
+# version had no retry at all — a single 429 on, say, a team's recent-form
+# call permanently marked that team's form UNKNOWN for the whole match,
+# even though the very next request 30s later succeeded fine (see the
+# fixtures/odds/standings calls right around it in the same run). A couple
+# of bounded retries recovers most of these without risking a long stall.
+FOOTBALL_DATA_MAX_RETRIES = 2
+FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS = 30.0
+
 
 async def _fd_pace() -> None:
     """Sleep just enough to keep football-data.org calls at or under
@@ -783,18 +793,51 @@ async def _fd_pace() -> None:
     _fd_last_request_time = time.time()
 
 
+async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None) -> dict:
+    """Shared GET helper for the three new football-data.org endpoints:
+    paces every attempt, and on a 429 retries up to FOOTBALL_DATA_MAX_RETRIES
+    times, honoring the server's Retry-After header when present instead of
+    guessing. Raises on final failure (including a 429 that never clears) so
+    each caller's existing try/except still turns that into a clean {}."""
+    last_exc: Exception | None = None
+    for attempt in range(FOOTBALL_DATA_MAX_RETRIES + 1):
+        await _fd_pace()
+        resp = await http.get(
+            url,
+            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
+            params=params,
+        )
+        if resp.status_code == 429:
+            if attempt >= FOOTBALL_DATA_MAX_RETRIES:
+                resp.raise_for_status()  # exhausted retries — let caller's except handle it
+            retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+            try:
+                wait = float(retry_after) if retry_after else FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS
+            except ValueError:
+                wait = FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS
+            logger.warning(
+                f"[SCOUT] football-data.org 429 on {url} "
+                f"(attempt {attempt + 1}/{FOOTBALL_DATA_MAX_RETRIES}) — retrying in {wait:.0f}s"
+            )
+            await asyncio.sleep(wait)
+            continue
+        try:
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_exc = e
+            break
+    if last_exc:
+        raise last_exc
+    return {}
+
+
 async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dict[int, dict]:
     """Returns {team_id: {"position", "points", "played", "goal_diff"}} for
     the given competition's current TOTAL table. Empty dict on any failure —
     callers must treat a missing team as UNKNOWN, not assume last place."""
-    await _fd_pace()
     try:
-        resp = await http.get(
-            f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/standings",
-            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        data = await _fd_get(http, f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/standings")
     except Exception as e:
         logger.warning(f"[SCOUT] Standings fetch failed for {competition_code}: {e}")
         return {}
@@ -821,15 +864,12 @@ async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
     "goals_for", "goals_against"} from the team's last 5 FINISHED matches
     across all competitions. Empty dict on any failure or if no finished
     matches are found — callers must treat that as UNKNOWN, not "0 wins"."""
-    await _fd_pace()
     try:
-        resp = await http.get(
+        data = await _fd_get(
+            http,
             f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
-            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
             params={"status": "FINISHED", "limit": 5},
         )
-        resp.raise_for_status()
-        data = resp.json()
     except Exception as e:
         logger.warning(f"[SCOUT] Recent-form fetch failed for team {team_id}: {e}")
         return {}
@@ -863,15 +903,12 @@ async def fetch_head_to_head(http: httpx.AsyncClient, fixture_id: int) -> dict:
     real head-to-head aggregate for this exact fixture (last 10 meetings).
     Empty dict on any failure — callers must treat that as UNKNOWN, not
     "no history"."""
-    await _fd_pace()
     try:
-        resp = await http.get(
+        data = await _fd_get(
+            http,
             f"{FOOTBALL_DATA_BASE}/matches/{fixture_id}/head2head",
-            headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
             params={"limit": 10},
         )
-        resp.raise_for_status()
-        data = resp.json()
     except Exception as e:
         logger.warning(f"[SCOUT] Head-to-head fetch failed for fixture {fixture_id}: {e}")
         return {}
