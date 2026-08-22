@@ -51,19 +51,32 @@ _current_model_index = 0
 #
 # All three models support reasoning_effort (per console.groq.com/docs/
 # reasoning and the qwen3.6-27b model card, checked 2026-08-22), but the
-# valid values differ by family:
-#   - gpt-oss (20b/120b): "low" | "medium" | "high" — reasoning is always on
-#     to some degree and can't be fully disabled, so "low" is the floor.
-#   - qwen3.6-27b: "none" | "default" — "none" is genuine non-thinking mode
-#     per Groq's own model card ("use non-thinking mode (reasoning_effort=
-#     'none') for efficient, general-purpose dialogue").
+# valid values — and what they actually MEAN — differ by family in a way
+# that matters a lot for a token-budgeted pipeline:
+#   - gpt-oss (20b/120b): "low" | "medium" | "high" — three genuinely
+#     bounded steps on the same scale.
+#   - qwen3.6-27b: "none" | "default" — NOT bounded steps. Per Groq's own
+#     model card, "default" is literally "thinking mode... for complex
+#     reasoning, math, and coding" — genuinely open-ended chain-of-thought
+#     with no built-in ceiling. Real-world reports on this model family
+#     show it burning 20,000+ reasoning tokens on trivial requests when
+#     left in this mode; in Football Pulse AI's Portfolio agent (a
+#     different file, backend/agents/pipeline_agents.py) this exact setting
+#     caused finish_reason="length" with completely EMPTY content even
+#     after doubling max_tokens, because the model was spending the whole
+#     budget on invisible reasoning with no ceiling to hit.
 #
 # Scout's job here (turn raw fixture data into structured JSON) is bounded
 # structured-output work, not open-ended reasoning, so "minimal" is used
-# for every call.
+# for every call — which already avoids qwen's "default"/thinking-mode trap
+# entirely. The "default" entry below is kept only so the mapping stays
+# consistent with pipeline_agents.py's table; qwen maps "default" to "none"
+# (not "default") for the same reason described there — qwen has no bounded
+# middle ground the way gpt-oss does, so nothing in this pipeline should
+# ever put qwen into its literal thinking mode.
 _REASONING_EFFORT_BY_FAMILY: dict[str, dict[str, str]] = {
     "gpt-oss": {"minimal": "low", "default": "medium"},
-    "qwen": {"minimal": "none", "default": "default"},
+    "qwen": {"minimal": "none", "default": "none"},
 }
 
 
