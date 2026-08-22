@@ -14,8 +14,8 @@ from groq import Groq
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Model: llama-3.1-8b-instant — 20,000 TPM free tier
-GROQ_MODEL = "llama-3.1-8b-instant"
+# Model: meta-llama/llama-4-maverick-17b-128e-instruct — 20,000 TPM free tier
+GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
 GROQ_CALL_DELAY_SECONDS = 6
 
 JSON_RULES = """
