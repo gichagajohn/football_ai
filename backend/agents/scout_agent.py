@@ -264,8 +264,8 @@ def _get_venue_city(home_team_name: str) -> str | None:
     return None
 
 
-# Model in use — meta-llama/llama-4-maverick-17b-128e-instruct has 20,000 TPM on the free tier.
-GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Model in use — openai/gpt-oss-20b has 20,000 TPM on the free tier.
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_CALL_DELAY_SECONDS = 6
 
 
@@ -642,7 +642,7 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 async def run(target_date: date | None = None) -> list[dict]:
     """
     Main scout agent entrypoint.
-    Model: meta-llama/llama-4-maverick-17b-128e-instruct (20,000 TPM free tier).
+    Model: openai/gpt-oss-20b (20,000 TPM free tier).
     Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
     """
     target_date = target_date or date.today()
