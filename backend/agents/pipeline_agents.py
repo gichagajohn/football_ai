@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any
 
-from groq import Groq, RateLimitError
+from groq import Groq, NotFoundError, RateLimitError
 
 logger = logging.getLogger(__name__)
 # max_retries=0: we do our own pacing + retry below so the two mechanisms
@@ -21,10 +21,17 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
 # next model instead of sleeping out a multi-minute daily cooldown. Each
 # model on Groq has its own independent daily budget, so this unblocks the
 # run immediately. Ordered by preference; only falls forward, never back.
+#
+# NOTE: Groq deprecates/retires models on short notice (llama-3.1-8b-instant
+# and llama-3.3-70b-versatile were both shut down Aug 16, 2026). If a model
+# in this chain starts 404ing, it's a good sign this list needs an update —
+# check https://console.groq.com/docs/models for the current lineup. The
+# code below already treats a 404 as "unusable, skip it" rather than crashing,
+# but a stale chain still means fewer real fallback options in practice.
 GROQ_MODEL_FALLBACK_CHAIN = [
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
 ]
 _current_model_index = 0
 
@@ -41,7 +48,7 @@ def _switch_to_next_model() -> bool:
     _current_model_index += 1
     _token_usage_log.clear()  # fresh model = fresh TPM budget, don't carry over pacing state
     logger.warning(
-        f"[FALLBACK] Daily quota hit on previous model — switching to {_current_model()}"
+        f"[FALLBACK] Switching to {_current_model()}"
     )
     return True
 
@@ -324,6 +331,16 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
             )
             time.sleep(wait)
             continue
+        except NotFoundError as e:
+            # Model doesn't exist / no access — e.g. deprecated or renamed.
+            # This isn't a transient rate limit, so retrying the same model
+            # is pointless; skip straight to the next one in the chain.
+            logger.error(f"[FALLBACK] {_current_model()} unavailable ({e}) — trying next model")
+            if _switch_to_next_model():
+                continue
+            raise RuntimeError(
+                f"Groq API: {_current_model()} unavailable and no fallback models remain"
+            ) from e
 
         usage = getattr(response, "usage", None)
         actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
