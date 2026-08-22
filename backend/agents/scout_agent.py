@@ -10,11 +10,83 @@ import os
 import re
 from datetime import date
 
+import time
+
 import httpx
-from groq import Groq
+from groq import Groq, RateLimitError
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# max_retries=0: we do our own TPM-aware pacing + retry (see _groq_chat below)
+# instead of relying on the SDK's blind exponential backoff.
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
+
+GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", 18000))
+GROQ_TPM_WINDOW_SECONDS = 60
+GROQ_MAX_LOCAL_RETRIES = 4
+_token_usage_log: list[tuple[float, int]] = []
+
+
+def _tokens_used_in_window(now: float) -> int:
+    cutoff = now - GROQ_TPM_WINDOW_SECONDS
+    while _token_usage_log and _token_usage_log[0][0] < cutoff:
+        _token_usage_log.pop(0)
+    return sum(tokens for _, tokens in _token_usage_log)
+
+
+def _pace_before_call(estimated_tokens: int) -> None:
+    now = time.time()
+    used = _tokens_used_in_window(now)
+    if used + estimated_tokens <= GROQ_TPM_LIMIT:
+        return
+    wait = (_token_usage_log[0][0] + GROQ_TPM_WINDOW_SECONDS) - now
+    if wait > 0:
+        logger.info(
+            f"[RATE LIMIT] {used}+{estimated_tokens} tokens would exceed the "
+            f"{GROQ_TPM_LIMIT} TPM budget — pacing {wait:.1f}s before next call"
+        )
+        time.sleep(wait)
+
+
+def _retry_after_seconds(err: RateLimitError) -> float | None:
+    try:
+        header = err.response.headers.get("retry-after")
+        return float(header) if header is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
+    """Same rate-limit-aware choke point as backend/agents/pipeline_agents.py —
+    paces calls against real rolling TPM usage instead of a flat sleep, and
+    honors the server's Retry-After header if a 429 still slips through."""
+    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+    estimated_tokens = (prompt_chars // 4) + max_tokens
+
+    for attempt in range(GROQ_MAX_LOCAL_RETRIES):
+        _pace_before_call(estimated_tokens)
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                max_tokens=max_tokens,
+                messages=messages,
+            )
+        except RateLimitError as e:
+            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
+            logger.warning(
+                f"[RATE LIMIT] Groq 429 (attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) "
+                f"— sleeping {wait:.1f}s"
+            )
+            time.sleep(wait)
+            continue
+
+        usage = getattr(response, "usage", None)
+        actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
+        _token_usage_log.append((time.time(), actual_tokens))
+        return response.choices[0].message.content
+
+    raise RuntimeError(
+        f"Groq API: still rate-limited after {GROQ_MAX_LOCAL_RETRIES} local retries"
+    )
 
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
@@ -266,7 +338,6 @@ def _get_venue_city(home_team_name: str) -> str | None:
 
 # Model in use — openai/gpt-oss-20b has 20,000 TPM on the free tier.
 GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_CALL_DELAY_SECONDS = 6
 
 
 def _load_league_ids() -> dict[str, str]:
@@ -514,8 +585,7 @@ def _extract_json(text: str) -> dict:
 
 
 def analyze_with_groq(raw_data: dict) -> dict:
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    text = _groq_chat(
         max_tokens=2048,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -546,7 +616,6 @@ Return a JSON object with this structure (and nothing else):
             }
         ],
     )
-    text = response.choices[0].message.content
     result = _extract_json(text)
 
     # Guard: if the model returned a list instead of a dict, unwrap it
@@ -700,7 +769,8 @@ async def run(target_date: date | None = None) -> list[dict]:
         for fixture, odds_event in batch:
             structured = await _deep_analyze(fixture, odds_event, epl_injuries)
             results.append(structured)
-            await asyncio.sleep(GROQ_CALL_DELAY_SECONDS)
+            # No fixed sleep here anymore — analyze_with_groq's _groq_chat call
+            # already paces itself against the real rolling TPM budget.
 
         qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
         logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
