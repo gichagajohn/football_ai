@@ -9,14 +9,27 @@ import re
 import time
 from typing import Any
 
-from groq import Groq
+from groq import Groq, RateLimitError
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# max_retries=0: we do our own pacing + retry below so the two mechanisms
+# don't stack (SDK backoff + our backoff was making failures take even longer).
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
 
 # Model: openai/gpt-oss-20b — 20,000 TPM free tier
 GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_CALL_DELAY_SECONDS = 6
+
+# A flat inter-call delay isn't enough to stay under the account's TPM budget
+# because prompt size (and therefore token cost) varies a lot per match —
+# that's why the daily run was getting a 429 on almost every single call even
+# with a 6s gap between requests. Instead we track actual token usage over a
+# rolling 60s window and only pace/wait when we're actually about to exceed
+# the budget, with a safety margin below the documented 20,000 TPM cap.
+GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", 18000))
+GROQ_TPM_WINDOW_SECONDS = 60
+GROQ_MAX_LOCAL_RETRIES = 4
+
+_token_usage_log: list[tuple[float, int]] = []
 
 JSON_RULES = """
 
@@ -211,6 +224,79 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
+def _tokens_used_in_window(now: float) -> int:
+    """Prune the rolling log to the trailing window and return tokens used in it."""
+    cutoff = now - GROQ_TPM_WINDOW_SECONDS
+    while _token_usage_log and _token_usage_log[0][0] < cutoff:
+        _token_usage_log.pop(0)
+    return sum(tokens for _, tokens in _token_usage_log)
+
+
+def _pace_before_call(estimated_tokens: int) -> None:
+    """Sleep only if firing now would push us over the TPM budget.
+
+    This replaces a flat per-call sleep: when prompts are small we don't wait
+    at all, and when they're large (or we're already close to the cap) we
+    wait exactly long enough for the oldest usage to age out of the window —
+    instead of finding out via a 429 and letting the SDK guess a backoff.
+    """
+    now = time.time()
+    used = _tokens_used_in_window(now)
+    if used + estimated_tokens <= GROQ_TPM_LIMIT:
+        return
+    oldest_ts = _token_usage_log[0][0]
+    wait = (oldest_ts + GROQ_TPM_WINDOW_SECONDS) - now
+    if wait > 0:
+        logger.info(
+            f"[RATE LIMIT] {used}+{estimated_tokens} tokens would exceed the "
+            f"{GROQ_TPM_LIMIT} TPM budget — pacing {wait:.1f}s before next call"
+        )
+        time.sleep(wait)
+
+
+def _retry_after_seconds(err: RateLimitError) -> float | None:
+    try:
+        header = err.response.headers.get("retry-after")
+        return float(header) if header is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
+    """Single choke point for every Groq call: paces requests against the
+    account's real TPM budget, and if a 429 still slips through, backs off
+    using the server's Retry-After header (falling back to exponential
+    backoff) instead of failing the whole pipeline run."""
+    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+    estimated_tokens = (prompt_chars // 4) + max_tokens
+
+    for attempt in range(GROQ_MAX_LOCAL_RETRIES):
+        _pace_before_call(estimated_tokens)
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                max_tokens=max_tokens,
+                messages=messages,
+            )
+        except RateLimitError as e:
+            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
+            logger.warning(
+                f"[RATE LIMIT] Groq 429 (attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) "
+                f"— sleeping {wait:.1f}s"
+            )
+            time.sleep(wait)
+            continue
+
+        usage = getattr(response, "usage", None)
+        actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
+        _token_usage_log.append((time.time(), actual_tokens))
+        return response.choices[0].message.content
+
+    raise RuntimeError(
+        f"Groq API: still rate-limited after {GROQ_MAX_LOCAL_RETRIES} local retries"
+    )
+
+
 def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
     try:
         home = odds_snapshot.get("home_win")
@@ -265,8 +351,7 @@ def _valid(odds: float | None) -> float | None:
 def run_analyst(clean_matches: list[dict]) -> list[dict]:
     probabilities = []
     for i, match in enumerate(clean_matches):
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
+        text = _groq_chat(
             max_tokens=1500,
             messages=[
                 {"role": "system", "content": ANALYST_PROMPT},
@@ -299,7 +384,6 @@ Return JSON:
                 }
             ]
         )
-        text = response.choices[0].message.content
         data = _extract_json(text)
         if data:
             data.setdefault("fixture_id", match.get("fixture_id"))
@@ -314,8 +398,6 @@ Return JSON:
             )
         else:
             logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
-        if i < len(clean_matches) - 1:
-            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
 
 
@@ -323,8 +405,7 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
     safe = []
     for i, prob in enumerate(probabilities):
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
+        text = _groq_chat(
             max_tokens=600,
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
@@ -334,7 +415,6 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
                 }
             ]
         )
-        text = response.choices[0].message.content
         risk_data = _extract_json(text)
         if not risk_data:
             logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
@@ -351,8 +431,6 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
                 f"— model_confidence={prob.get('model_confidence')} "
                 f"— {risk_data.get('rejection_reason')}"
             )
-        if i < len(probabilities) - 1:
-            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
@@ -362,8 +440,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
 
     match_lookup = {m.get("fixture_id"): m for m in safe_matches}
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    text = _groq_chat(
         max_tokens=1500,
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
@@ -373,7 +450,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             }
         ]
     )
-    text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
         logger.error(f"Portfolio parse error: {text[:200]}")
@@ -438,8 +514,7 @@ def run_auditor(portfolio: dict) -> dict:
     if portfolio.get("decision") == "NO_BET":
         return {"auditor_verdict": "REJECT", "critical_flags": ["No portfolio to audit — already NO_BET."]}
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    text = _groq_chat(
         max_tokens=1500,
         messages=[
             {"role": "system", "content": AUDITOR_PROMPT},
@@ -449,7 +524,6 @@ def run_auditor(portfolio: dict) -> dict:
             }
         ]
     )
-    text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
         logger.error(f"Auditor parse error: {text[:200]}")
@@ -464,8 +538,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     if audited.get("auditor_verdict") == "REJECT":
         return {"decision": "NO_BET", "reason": f"Auditor rejected: {audited.get('critical_flags')}", "final_confidence": 0.0}
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    text = _groq_chat(
         max_tokens=400,
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
@@ -475,7 +548,6 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
             }
         ]
     )
-    text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
         logger.error(f"Decision parse error: {text[:200]}")
@@ -530,8 +602,7 @@ the 70%+ confidence threshold today.
 Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    return _groq_chat(
         max_tokens=1200,
         messages=[
             {"role": "system", "content": PUBLISHER_PROMPT},
@@ -545,4 +616,3 @@ Audited: {json.dumps(audited)}"""
             }
         ]
     )
-    return response.choices[0].message.content
