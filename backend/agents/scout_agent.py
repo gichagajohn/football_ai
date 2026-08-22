@@ -14,7 +14,7 @@ import httpx
 from groq import Groq
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=8)
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
@@ -265,8 +265,8 @@ def _get_venue_city(home_team_name: str) -> str | None:
 
 
 # Model in use — llama-3.1-8b-instant has 20,000 TPM on the free tier.
-GROQ_MODEL = "openai/gpt-oss-20b"
-GROQ_CALL_DELAY_SECONDS = 12
+GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_CALL_DELAY_SECONDS = 6
 
 
 def _load_league_ids() -> dict[str, str]:
@@ -516,8 +516,7 @@ def _extract_json(text: str) -> dict:
 def analyze_with_groq(raw_data: dict) -> dict:
     response = client.chat.completions.create(
         model=GROQ_MODEL,
-        max_tokens=3072,
-        response_format={"type": "json_object"},
+        max_tokens=2048,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -549,11 +548,16 @@ Return a JSON object with this structure (and nothing else):
     )
     text = response.choices[0].message.content
     result = _extract_json(text)
-    if not result:
-        logger.error(
-            f"[SCOUT] Failed to parse LLM response as JSON (len={len(text)}). "
-            f"Start: {text[:300]!r} ... End: {text[-300:]!r}"
-        )
+
+    # Guard: if the model returned a list instead of a dict, unwrap it
+    if isinstance(result, list):
+        logger.warning("[SCOUT] LLM returned a list instead of a dict — unwrapping first element.")
+        result = result[0] if result and isinstance(result[0], dict) else {}
+
+    if not isinstance(result, dict):
+        logger.error(f"[SCOUT] Failed to parse LLM response as JSON object: {text[:200]}")
+        return {}
+
     return result
 
 
@@ -590,23 +594,8 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
     weather = await fetch_weather(venue_city)
 
-    # Send only the fields the SYSTEM_PROMPT actually needs. The raw
-    # football-data.org fixture includes crest URLs, referee lists, and
-    # other verbose metadata that costs prompt tokens without adding
-    # anything the model uses — trimming this meaningfully reduces load
-    # against gpt-oss-20b's tight 8,000 TPM ceiling.
-    fixture_trimmed = {
-        "id": fixture.get("id"),
-        "utcDate": fixture.get("utcDate"),
-        "status": fixture.get("status"),
-        "matchday": fixture.get("matchday"),
-        "homeTeam": {"name": home_name},
-        "awayTeam": {"name": away_name},
-        "competition": KNOWN_LEAGUE_NAMES.get(competition_code, competition_code),
-    }
-
     raw = {
-        "fixture": fixture_trimmed,
+        "fixture": fixture,
         "odds": odds_snapshot,
         "home_injuries": home_injuries,
         "away_injuries": away_injuries,
@@ -616,13 +605,16 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 
     structured = analyze_with_groq(raw)
 
-    # Never let a parsing failure erase the match's identity. These come
-    # straight from football-data.org, not the LLM, so they're always
-    # trustworthy — backfill them even if analyze_with_groq() returned {}.
-    structured.setdefault("home_team", home_name)
-    structured.setdefault("away_team", away_name)
-    structured.setdefault("league", KNOWN_LEAGUE_NAMES.get(competition_code, competition_code))
-    structured.setdefault("kickoff_utc", fixture.get("utcDate"))
+    # If LLM returned nothing usable, build a minimal skeleton so we don't crash
+    if not structured:
+        logger.warning(f"[SCOUT] analyze_with_groq returned empty result for {home_name} vs {away_name} — using skeleton.")
+        structured = {
+            "fixture_id": fixture_id,
+            "home_team": home_name,
+            "away_team": away_name,
+            "league": fixture.get("competition", {}).get("name", "Unknown"),
+            "data_completeness": 0.2,
+        }
 
     if "data_completeness" not in structured or structured.get("data_completeness") is None:
         score = 0.0
@@ -650,7 +642,7 @@ async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> 
 async def run(target_date: date | None = None) -> list[dict]:
     """
     Main scout agent entrypoint.
-    Model: openai/gpt-oss-20b (Groq's replacement for the retired llama-3.1-8b-instant).
+    Model: llama-3.1-8b-instant (20,000 TPM free tier).
     Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
     """
     target_date = target_date or date.today()
