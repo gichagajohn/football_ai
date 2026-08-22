@@ -35,6 +35,16 @@ GROQ_MODEL_FALLBACK_CHAIN = [
 ]
 _current_model_index = 0
 
+# Models in this chain that support the reasoning_effort param (gpt-oss family
+# only — qwen3.6-27b on Groq does not accept it and will error if we pass it).
+_REASONING_EFFORT_CAPABLE_SUBSTR = "gpt-oss"
+
+# Set by _groq_chat right before returning, so callers can enrich their own
+# parse-error logs with *why* the content was empty (truncated mid-reasoning
+# vs. some other cause) without changing _groq_chat's return type everywhere
+# it's called.
+_last_finish_reason: str | None = None
+
 
 def _current_model() -> str:
     return GROQ_MODEL_FALLBACK_CHAIN[_current_model_index]
@@ -71,6 +81,12 @@ def _is_daily_limit_error(err: RateLimitError) -> bool:
 GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", 18000))
 GROQ_TPM_WINDOW_SECONDS = 60
 GROQ_MAX_LOCAL_RETRIES = 4
+
+# Ceiling for the empty-content-due-to-truncated-reasoning retry in
+# _groq_chat. gpt-oss models can spend an entire max_tokens budget on hidden
+# chain-of-thought and return finish_reason="length" with empty content —
+# this caps how far we'll bump max_tokens chasing that before giving up.
+GROQ_EMPTY_CONTENT_RETRY_CEILING = 4000
 
 _token_usage_log: list[tuple[float, int]] = []
 
@@ -305,22 +321,44 @@ def _retry_after_seconds(err: RateLimitError) -> float | None:
         return None
 
 
-def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
+def _groq_chat(
+    *,
+    max_tokens: int,
+    messages: list[dict],
+    reasoning_effort: str | None = None,
+) -> str:
     """Single choke point for every Groq call: paces requests against the
     active model's TPM budget, falls forward to the next model in the chain
     on a daily-quota 429, and otherwise backs off using the server's
-    Retry-After header instead of failing the whole pipeline run."""
+    Retry-After header instead of failing the whole pipeline run.
+
+    Also guards against gpt-oss models spending their entire max_tokens
+    budget on hidden chain-of-thought and returning empty content with
+    finish_reason="length" — a real 200 OK that looks like a parse error
+    downstream. When that happens we bump max_tokens once (up to
+    GROQ_EMPTY_CONTENT_RETRY_CEILING) and retry the same call before
+    giving up, since the model did produce something, it just didn't
+    have room left to write the answer down.
+    """
+    global _last_finish_reason
     prompt_chars = sum(len(m.get("content", "")) for m in messages)
-    estimated_tokens = (prompt_chars // 4) + max_tokens
 
     for attempt in range(GROQ_MAX_LOCAL_RETRIES):
+        estimated_tokens = (prompt_chars // 4) + max_tokens
         _pace_before_call(estimated_tokens)
+        kwargs: dict[str, Any] = dict(
+            model=_current_model(),
+            max_tokens=max_tokens,
+            messages=messages,
+        )
+        if reasoning_effort and _REASONING_EFFORT_CAPABLE_SUBSTR in _current_model():
+            # groq==0.11.0's typed create() signature predates gpt-oss support
+            # and has no `reasoning_effort` parameter — passing it as a direct
+            # kwarg raises TypeError. extra_body merges it straight into the
+            # raw JSON request instead, which this SDK version does support.
+            kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
         try:
-            response = client.chat.completions.create(
-                model=_current_model(),
-                max_tokens=max_tokens,
-                messages=messages,
-            )
+            response = client.chat.completions.create(**kwargs)
         except RateLimitError as e:
             if _is_daily_limit_error(e) and _switch_to_next_model():
                 continue  # new model, new budget — retry now, no sleep needed
@@ -345,7 +383,22 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
         usage = getattr(response, "usage", None)
         actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
         _token_usage_log.append((time.time(), actual_tokens))
-        return response.choices[0].message.content
+
+        content = response.choices[0].message.content
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        _last_finish_reason = finish_reason
+
+        if not content and finish_reason == "length" and max_tokens < GROQ_EMPTY_CONTENT_RETRY_CEILING:
+            bumped = min(max_tokens * 2, GROQ_EMPTY_CONTENT_RETRY_CEILING)
+            logger.warning(
+                f"[EMPTY CONTENT] {_current_model()} exhausted {max_tokens} tokens "
+                f"on hidden reasoning with no visible output (finish_reason=length) — "
+                f"retrying with max_tokens={bumped}"
+            )
+            max_tokens = bumped
+            continue
+
+        return content or ""
 
     raise RuntimeError(
         f"Groq API: still rate-limited on {_current_model()} after "
@@ -454,7 +507,10 @@ Return JSON:
                 f"— model_confidence={data.get('model_confidence')}"
             )
         else:
-            logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
+            logger.error(
+                f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
+                f"(finish_reason={_last_finish_reason}): {text[:200]}"
+            )
     return probabilities
 
 
@@ -474,7 +530,10 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         )
         risk_data = _extract_json(text)
         if not risk_data:
-            logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
+            logger.error(
+                f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"(finish_reason={_last_finish_reason}): {text[:200]}"
+            )
         elif risk_data.get("approved"):
             prob["risk_assessment"] = risk_data
             safe.append(prob)
@@ -497,8 +556,16 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
 
     match_lookup = {m.get("fixture_id"): m for m in safe_matches}
 
+    # This is the most reasoning-heavy call in the pipeline — it has to weigh
+    # combinations across every safe candidate to hit an 8.0-13.0 combined-odds
+    # target. gpt-oss models can burn an entire small max_tokens budget on
+    # hidden chain-of-thought for a task like this and return empty content
+    # (finish_reason="length") even on a 200 OK. Giving it more room and a
+    # capped reasoning_effort makes that much less likely; _groq_chat's
+    # empty-content retry is the backstop if it still happens.
     text = _groq_chat(
-        max_tokens=1500,
+        max_tokens=3000,
+        reasoning_effort="low",
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
             {
@@ -509,8 +576,17 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     )
     data = _extract_json(text)
     if not data:
-        logger.error(f"Portfolio parse error: {text[:200]}")
-        return {"decision": "NO_BET", "reason": "Portfolio construction failed."}
+        logger.error(
+            f"Portfolio parse error (finish_reason={_last_finish_reason}, "
+            f"content_len={len(text)}): {text[:200]}"
+        )
+        reason = (
+            "Portfolio construction failed: model exhausted its token budget on "
+            "hidden reasoning with no output (finish_reason=length)."
+            if _last_finish_reason == "length"
+            else "Portfolio construction failed: model returned unparseable content."
+        )
+        return {"decision": "NO_BET", "reason": reason}
 
     if data.get("decision") == "NO_BET":
         return data
@@ -583,7 +659,7 @@ def run_auditor(portfolio: dict) -> dict:
     )
     data = _extract_json(text)
     if not data:
-        logger.error(f"Auditor parse error: {text[:200]}")
+        logger.error(f"Auditor parse error (finish_reason={_last_finish_reason}): {text[:200]}")
         return {"auditor_verdict": "REJECT", "critical_flags": ["Auditor system error — could not parse response."]}
     return data
 
@@ -607,7 +683,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     )
     data = _extract_json(text)
     if not data:
-        logger.error(f"Decision parse error: {text[:200]}")
+        logger.error(f"Decision parse error (finish_reason={_last_finish_reason}): {text[:200]}")
         return {"decision": "NO_BET", "reason": "Decision agent error — defaulting safe.", "final_confidence": 0.0}
 
     final_confidence = data.get("final_confidence")
