@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 # don't stack (SDK backoff + our backoff was making failures take even longer).
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
 
-# Model fallback chain: if the *active* model hits its daily quota (RPD/TPD —
-# not the per-minute TPM window our pacer already handles), we switch to the
-# next model instead of sleeping out a multi-minute daily cooldown. Each
-# model on Groq has its own independent daily budget, so this unblocks the
-# run immediately. Ordered by preference; only falls forward, never back.
+# Model fallback chain: if the *active* model hits its daily quota (RPD/TPD)
+# OR exhausts its local per-minute retries (RPM/TPM), we switch to the next
+# model instead of failing the whole run. Each model on Groq has its own
+# independent RPM/TPM/RPD/TPD budget, so this unblocks the run immediately.
+# Ordered by preference; only falls forward, never back.
 #
 # NOTE: Groq deprecates/retires models on short notice (llama-3.1-8b-instant
 # and llama-3.3-70b-versatile were both shut down Aug 16, 2026). If a model
@@ -56,7 +56,6 @@ def _switch_to_next_model() -> bool:
     if _current_model_index >= len(GROQ_MODEL_FALLBACK_CHAIN) - 1:
         return False
     _current_model_index += 1
-    _token_usage_log.clear()  # fresh model = fresh TPM budget, don't carry over pacing state
     logger.warning(
         f"[FALLBACK] Switching to {_current_model()}"
     )
@@ -72,14 +71,52 @@ def _is_daily_limit_error(err: RateLimitError) -> bool:
     return "per day" in msg or "tpd" in msg or "rpd" in msg
 
 
-# A flat inter-call delay isn't enough to stay under the account's TPM budget
-# because prompt size (and therefore token cost) varies a lot per match —
-# that's why the daily run was getting a 429 on almost every single call even
-# with a 6s gap between requests. Instead we track actual token usage over a
-# rolling 60s window and only pace/wait when we're actually about to exceed
-# the budget, with a safety margin below the documented 20,000 TPM cap.
-GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", 18000))
+# ---------------------------------------------------------------------------
+# Rate limit configuration
+#
+# Verified against https://console.groq.com/docs/rate-limits (checked
+# 2026-08-22). All three models currently in GROQ_MODEL_FALLBACK_CHAIN share
+# the same free-tier limits:
+#
+#     RPM=30   RPD=1,000   TPM=8,000   TPD=200,000
+#
+# IMPORTANT: earlier versions of this file assumed a flat 18,000 TPM budget
+# for every model — more than double the real 8,000 TPM cap. That mismatch
+# is why the daily run was getting 429'd on almost every call even with
+# pacing in place: the pacer thought it had headroom it didn't actually have.
+#
+# Two things Groq's response headers do and don't tell you:
+#   - x-ratelimit-remaining-tokens / x-ratelimit-reset-tokens: TPM, and it's
+#     authoritative — we read these off every response and prefer them over
+#     our own estimate whenever they're fresh.
+#   - RPM is NOT exposed in headers at all (only RPD is, confusingly under
+#     the name x-ratelimit-remaining-requests). So RPM has to be paced
+#     locally from a rolling request-timestamp log; there's no way to read
+#     the real-time figure from Groq directly.
+#
+# If Groq changes these limits, or the fallback chain gains a model with
+# different limits, update MODEL_LIMITS accordingly — check the current
+# table at console.groq.com/docs/rate-limits.
+MODEL_LIMITS: dict[str, dict[str, int]] = {
+    "openai/gpt-oss-20b": {"rpm": 30, "tpm": 8000},
+    "openai/gpt-oss-120b": {"rpm": 30, "tpm": 8000},
+    "qwen/qwen3.6-27b": {"rpm": 30, "tpm": 8000},
+}
+_DEFAULT_MODEL_LIMITS = {"rpm": 30, "tpm": 8000}
+
+# Safety margin: pace against this fraction of the documented cap, not the
+# full cap, so normal jitter/estimation error doesn't still land us on a 429.
+GROQ_SAFETY_MARGIN = 0.85
+
 GROQ_TPM_WINDOW_SECONDS = 60
+GROQ_RPM_WINDOW_SECONDS = 60
+
+# Local retries *per model* before we give up on that model and fall forward
+# to the next one in the chain (if any remain). Previously this was a flat
+# 4 retries with no forward-fallback on plain rate-limit exhaustion — only
+# on errors that explicitly said "per day" — which meant a model stuck in a
+# tight per-minute rate-limit loop could exhaust all retries and crash the
+# whole pipeline even while other models in the chain sat completely unused.
 GROQ_MAX_LOCAL_RETRIES = 4
 
 # Ceiling for the truncation retry in _groq_chat. gpt-oss models can run out
@@ -90,8 +127,6 @@ GROQ_MAX_LOCAL_RETRIES = 4
 # emptiness is not a reliable signal on its own, so the retry keys off
 # finish_reason alone. This caps how far we'll bump max_tokens chasing it.
 GROQ_TRUNCATION_RETRY_CEILING = 6000
-
-_token_usage_log: list[tuple[float, int]] = []
 
 JSON_RULES = """
 
@@ -286,32 +321,150 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
-def _tokens_used_in_window(now: float) -> int:
-    """Prune the rolling log to the trailing window and return tokens used in it."""
-    cutoff = now - GROQ_TPM_WINDOW_SECONDS
-    while _token_usage_log and _token_usage_log[0][0] < cutoff:
-        _token_usage_log.pop(0)
-    return sum(tokens for _, tokens in _token_usage_log)
+# ---------------------------------------------------------------------------
+# Per-model rate limit state.
+#
+# Keyed by model name (not just "the active model") so that switching back
+# and forth in the chain — or simply having already made calls on a model
+# earlier in the run — doesn't lose pacing history for that model.
+class _ModelRateState:
+    __slots__ = (
+        "request_times",
+        "token_log",
+        "header_remaining_tokens",
+        "header_reset_tokens_at",
+    )
+
+    def __init__(self) -> None:
+        self.request_times: list[float] = []
+        self.token_log: list[tuple[float, int]] = []
+        # Authoritative figures parsed from Groq's own response headers.
+        # None until we've seen at least one response for this model.
+        self.header_remaining_tokens: int | None = None
+        self.header_reset_tokens_at: float | None = None  # absolute time.time()
 
 
-def _pace_before_call(estimated_tokens: int) -> None:
-    """Sleep only if firing now would push us over the TPM budget.
+_model_states: dict[str, _ModelRateState] = {}
 
-    This replaces a flat per-call sleep: when prompts are small we don't wait
-    at all, and when they're large (or we're already close to the cap) we
-    wait exactly long enough for the oldest usage to age out of the window —
-    instead of finding out via a 429 and letting the SDK guess a backoff.
+
+def _state_for(model: str) -> _ModelRateState:
+    if model not in _model_states:
+        _model_states[model] = _ModelRateState()
+    return _model_states[model]
+
+
+def _limits_for(model: str) -> dict[str, int]:
+    return MODEL_LIMITS.get(model, _DEFAULT_MODEL_LIMITS)
+
+
+def _parse_reset_duration(value: str | None) -> float:
+    """Parse Groq's reset-time header format into seconds.
+
+    Observed formats: "7.66s", "2m59.56s", "120ms", "1.2s".
+    Returns 0.0 if the value is missing or unparseable (caller should treat
+    that as "no usable signal", not "reset is instant").
+    """
+    if not value:
+        return 0.0
+    value = value.strip()
+    if value.endswith("ms"):
+        try:
+            return float(value[:-2]) / 1000.0
+        except ValueError:
+            return 0.0
+    m = re.match(r"^(?:(\d+)m)?(?:([\d.]+)s)?$", value)
+    if not m or (m.group(1) is None and m.group(2) is None):
+        return 0.0
+    minutes = float(m.group(1)) if m.group(1) else 0.0
+    seconds = float(m.group(2)) if m.group(2) else 0.0
+    return minutes * 60 + seconds
+
+
+def _record_headers(model: str, headers: Any) -> None:
+    """Pull the authoritative TPM figures Groq hands back on every response
+    (success or 429) and stash them so the next _pace_before_call for this
+    model can use real numbers instead of our local estimate."""
+    if headers is None:
+        return
+    state = _state_for(model)
+    try:
+        remaining = headers.get("x-ratelimit-remaining-tokens")
+        reset = headers.get("x-ratelimit-reset-tokens")
+    except AttributeError:
+        return
+    if remaining is None:
+        return
+    try:
+        state.header_remaining_tokens = int(remaining)
+    except (TypeError, ValueError):
+        return
+    reset_seconds = _parse_reset_duration(reset)
+    state.header_reset_tokens_at = time.time() + reset_seconds
+
+
+def _prune(log: list, cutoff: float, key=lambda item: item) -> None:
+    while log and key(log[0]) < cutoff:
+        log.pop(0)
+
+
+def _pace_before_call(model: str, estimated_tokens: int) -> None:
+    """Sleep only if firing now would push us over this model's RPM or TPM
+    budget. Prefers Groq's own header-reported TPM figures when we have a
+    fresh reading for this model; falls back to a local rolling-window
+    estimate otherwise (e.g. on the very first call to a model, before we've
+    seen any headers for it yet).
+
+    RPM has no equivalent header from Groq at all, so it's always paced from
+    our own local request-timestamp log against the documented per-model cap.
     """
     now = time.time()
-    used = _tokens_used_in_window(now)
-    if used + estimated_tokens <= GROQ_TPM_LIMIT:
+    state = _state_for(model)
+    limits = _limits_for(model)
+    rpm_cap = max(1, int(limits["rpm"] * GROQ_SAFETY_MARGIN))
+    tpm_cap = max(1, int(limits["tpm"] * GROQ_SAFETY_MARGIN))
+
+    # --- RPM pacing (local-only; Groq doesn't expose this in headers) ---
+    _prune(state.request_times, now - GROQ_RPM_WINDOW_SECONDS)
+    if len(state.request_times) >= rpm_cap:
+        oldest = state.request_times[0]
+        wait = (oldest + GROQ_RPM_WINDOW_SECONDS) - now
+        if wait > 0:
+            logger.info(
+                f"[RATE LIMIT] {model}: {len(state.request_times)}/{rpm_cap} "
+                f"requests in the last {GROQ_RPM_WINDOW_SECONDS}s — pacing {wait:.1f}s"
+            )
+            time.sleep(wait)
+            now = time.time()
+
+    # --- TPM pacing: prefer Groq's own header figures when fresh ---
+    if (
+        state.header_remaining_tokens is not None
+        and state.header_reset_tokens_at is not None
+        and now < state.header_reset_tokens_at
+    ):
+        if state.header_remaining_tokens < estimated_tokens:
+            wait = state.header_reset_tokens_at - now
+            if wait > 0:
+                logger.info(
+                    f"[RATE LIMIT] {model}: Groq reports only "
+                    f"{state.header_remaining_tokens} tokens left this window "
+                    f"(need ~{estimated_tokens}) — pacing {wait:.1f}s"
+                )
+                time.sleep(wait)
         return
-    oldest_ts = _token_usage_log[0][0]
+
+    # Fallback: no fresh header reading yet for this model — estimate from
+    # our own local log against the documented (safety-margined) TPM cap.
+    _prune(state.token_log, now - GROQ_TPM_WINDOW_SECONDS, key=lambda item: item[0])
+    used = sum(tokens for _, tokens in state.token_log)
+    if used + estimated_tokens <= tpm_cap:
+        return
+    oldest_ts = state.token_log[0][0]
     wait = (oldest_ts + GROQ_TPM_WINDOW_SECONDS) - now
     if wait > 0:
         logger.info(
-            f"[RATE LIMIT] {used}+{estimated_tokens} tokens would exceed the "
-            f"{GROQ_TPM_LIMIT} TPM budget — pacing {wait:.1f}s before next call"
+            f"[RATE LIMIT] {model}: {used}+{estimated_tokens} tokens would "
+            f"exceed the ~{tpm_cap} TPM budget — pacing {wait:.1f}s"
         )
         time.sleep(wait)
 
@@ -331,9 +484,12 @@ def _groq_chat(
     reasoning_effort: str | None = None,
 ) -> str:
     """Single choke point for every Groq call: paces requests against the
-    active model's TPM budget, falls forward to the next model in the chain
-    on a daily-quota 429, and otherwise backs off using the server's
-    Retry-After header instead of failing the whole pipeline run.
+    active model's real RPM/TPM budget (per console.groq.com/docs/rate-limits,
+    preferring Groq's own response headers over local estimates once we have
+    them), falls forward to the next model in the chain on a daily-quota 429
+    OR on exhausting local retries for a per-minute limit, and otherwise
+    backs off using the server's Retry-After header instead of failing the
+    whole pipeline run.
 
     Also guards against gpt-oss models running out of max_tokens before
     finishing their answer — signaled by finish_reason="length" — which can
@@ -347,29 +503,67 @@ def _groq_chat(
     global _last_finish_reason
     prompt_chars = sum(len(m.get("content", "")) for m in messages)
 
-    for attempt in range(GROQ_MAX_LOCAL_RETRIES):
+    attempt = 0
+    while True:
+        model = _current_model()
         estimated_tokens = (prompt_chars // 4) + max_tokens
-        _pace_before_call(estimated_tokens)
+        _pace_before_call(model, estimated_tokens)
         kwargs: dict[str, Any] = dict(
-            model=_current_model(),
+            model=model,
             max_tokens=max_tokens,
             messages=messages,
         )
-        if reasoning_effort and _REASONING_EFFORT_CAPABLE_SUBSTR in _current_model():
+        if reasoning_effort and _REASONING_EFFORT_CAPABLE_SUBSTR in model:
             # groq==0.11.0's typed create() signature predates gpt-oss support
             # and has no `reasoning_effort` parameter — passing it as a direct
             # kwarg raises TypeError. extra_body merges it straight into the
             # raw JSON request instead, which this SDK version does support.
             kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+
         try:
-            response = client.chat.completions.create(**kwargs)
+            # with_raw_response gives us access to Groq's rate-limit headers
+            # (x-ratelimit-remaining-tokens / x-ratelimit-reset-tokens) so
+            # _pace_before_call can use real numbers instead of only a local
+            # estimate. Falls back to the plain call if this SDK version
+            # doesn't support it, so a SDK upgrade/downgrade can't crash the
+            # pipeline outright — it just loses header-based calibration.
+            try:
+                raw = client.chat.completions.with_raw_response.create(**kwargs)
+                _record_headers(model, getattr(raw, "headers", None))
+                response = raw.parse()
+            except AttributeError:
+                response = client.chat.completions.create(**kwargs)
         except RateLimitError as e:
+            _record_headers(model, getattr(getattr(e, "response", None), "headers", None))
             if _is_daily_limit_error(e) and _switch_to_next_model():
+                attempt = 0
                 continue  # new model, new budget — retry now, no sleep needed
+
+            attempt += 1
+            if attempt >= GROQ_MAX_LOCAL_RETRIES:
+                # Exhausted local retries on this model for a per-minute
+                # limit. Previously this raised immediately even when other
+                # models in the chain were untouched — now we fall forward
+                # to them first, same as we already do for daily-quota
+                # errors, and only raise once the whole chain is exhausted.
+                if _switch_to_next_model():
+                    logger.warning(
+                        f"[FALLBACK] {model} exhausted {GROQ_MAX_LOCAL_RETRIES} "
+                        f"local retries on a per-minute rate limit — "
+                        f"falling forward to {_current_model()}"
+                    )
+                    attempt = 0
+                    continue
+                raise RuntimeError(
+                    f"Groq API: still rate-limited on {model} after "
+                    f"{GROQ_MAX_LOCAL_RETRIES} local retries, and no fallback "
+                    f"models remain in the chain."
+                ) from e
+
             wait = _retry_after_seconds(e) or (2 ** attempt) * 5
             logger.warning(
-                f"[RATE LIMIT] Groq 429 on {_current_model()} "
-                f"(attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
+                f"[RATE LIMIT] Groq 429 on {model} "
+                f"(attempt {attempt}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
             )
             time.sleep(wait)
             continue
@@ -377,16 +571,20 @@ def _groq_chat(
             # Model doesn't exist / no access — e.g. deprecated or renamed.
             # This isn't a transient rate limit, so retrying the same model
             # is pointless; skip straight to the next one in the chain.
-            logger.error(f"[FALLBACK] {_current_model()} unavailable ({e}) — trying next model")
+            logger.error(f"[FALLBACK] {model} unavailable ({e}) — trying next model")
             if _switch_to_next_model():
+                attempt = 0
                 continue
             raise RuntimeError(
-                f"Groq API: {_current_model()} unavailable and no fallback models remain"
+                f"Groq API: {model} unavailable and no fallback models remain"
             ) from e
 
         usage = getattr(response, "usage", None)
         actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
-        _token_usage_log.append((time.time(), actual_tokens))
+        state = _state_for(model)
+        now = time.time()
+        state.request_times.append(now)
+        state.token_log.append((now, actual_tokens))
 
         content = response.choices[0].message.content
         finish_reason = getattr(response.choices[0], "finish_reason", None)
@@ -400,7 +598,7 @@ def _groq_chat(
             bumped = min(max_tokens * 2, GROQ_TRUNCATION_RETRY_CEILING)
             preview = (content or "")[:80]
             logger.warning(
-                f"[TRUNCATED] {_current_model()} hit its {max_tokens}-token limit "
+                f"[TRUNCATED] {model} hit its {max_tokens}-token limit "
                 f"before finishing (finish_reason=length, content={'empty' if not content else f'partial: {preview!r}'}) "
                 f"— retrying with max_tokens={bumped}"
             )
@@ -408,12 +606,6 @@ def _groq_chat(
             continue
 
         return content or ""
-
-    raise RuntimeError(
-        f"Groq API: still rate-limited on {_current_model()} after "
-        f"{GROQ_MAX_LOCAL_RETRIES} local retries (fallback chain exhausted: "
-        f"{_current_model_index == len(GROQ_MODEL_FALLBACK_CHAIN) - 1})"
-    )
 
 
 def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
