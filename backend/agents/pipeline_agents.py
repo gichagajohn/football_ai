@@ -35,9 +35,56 @@ GROQ_MODEL_FALLBACK_CHAIN = [
 ]
 _current_model_index = 0
 
-# Models in this chain that support the reasoning_effort param (gpt-oss family
-# only — qwen3.6-27b on Groq does not accept it and will error if we pass it).
-_REASONING_EFFORT_CAPABLE_SUBSTR = "gpt-oss"
+# ---------------------------------------------------------------------------
+# Reasoning control.
+#
+# Every model in the fallback chain is a *reasoning* model, and left on
+# default settings all three will write out a full chain-of-thought before
+# (or instead of) answering. That reasoning counts as ordinary output
+# tokens, so it: burns through the TPM budget fast, regularly blows past
+# max_tokens (triggering the truncation-retry path over and over), and on
+# qwen specifically has been observed to consume the *entire* response and
+# hit finish_reason="stop" having never emitted the requested JSON at all —
+# which _extract_json then correctly fails to parse.
+#
+# All three models in this chain support reasoning_effort (confirmed at
+# console.groq.com/docs/reasoning and the qwen3.6-27b model card, checked
+# 2026-08-22), but the valid values differ by family:
+#   - gpt-oss (20b/120b): "low" | "medium" | "high" — reasoning is always on
+#     to some degree and can't be fully disabled, so "low" is the floor.
+#   - qwen3.6-27b: "none" | "default" — "none" is genuine non-thinking mode
+#     per Groq's own model card ("use non-thinking mode (reasoning_effort=
+#     'none') for efficient, general-purpose dialogue").
+#
+# Every task in this file (Analyst/Risk/Portfolio/Auditor/Decision/Publisher)
+# is a bounded structured-output task, not open-ended problem solving, so
+# minimal reasoning is the right default everywhere. Portfolio is the one
+# call that benefits from a bit more room to weigh combinations, so it opts
+# into "default" via the reasoning_effort argument to _groq_chat.
+#
+# reasoning_format="hidden" is set unconditionally alongside reasoning_effort
+# (per the qwen model card's own recommendation: "set reasoning_format to
+# hidden to return only the final answer") as a second line of defense — if
+# a model still reasons a little under "low"/"none", the reasoning tokens
+# don't leak into `content` and break JSON parsing.
+_REASONING_EFFORT_BY_FAMILY: dict[str, dict[str, str]] = {
+    "gpt-oss": {"minimal": "low", "default": "medium"},
+    "qwen": {"minimal": "none", "default": "default"},
+}
+
+
+def _reasoning_extra_body(model: str, desired: str) -> dict[str, str]:
+    """Build the extra_body payload controlling reasoning for `model`.
+
+    Returns {} for any model not in _REASONING_EFFORT_BY_FAMILY (i.e. a
+    future non-reasoning model added to the chain) so we never send a
+    reasoning param a model doesn't understand.
+    """
+    for family, effort_map in _REASONING_EFFORT_BY_FAMILY.items():
+        if family in model:
+            effort = effort_map.get(desired, effort_map["minimal"])
+            return {"reasoning_effort": effort, "reasoning_format": "hidden"}
+    return {}
 
 # Set by _groq_chat right before returning, so callers can enrich their own
 # parse-error logs with *why* the content was empty (truncated mid-reasoning
@@ -303,6 +350,18 @@ before or after."""
 def _extract_json(text: str) -> dict:
     if not text:
         return {}
+    # Defensive backstop: reasoning_format="hidden" should already keep
+    # <think> blocks out of `content` entirely, but if a model ever leaks
+    # one anyway (or reasoning_format is dropped in a future edit), strip it
+    # rather than let it defeat every parse strategy below. A dangling
+    # unclosed <think> (model ran out of budget mid-thought) is stripped too
+    # by treating everything from the opening tag onward as reasoning noise.
+    if "<think>" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+        text = text.strip()
+    if not text:
+        return {}
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -481,7 +540,7 @@ def _groq_chat(
     *,
     max_tokens: int,
     messages: list[dict],
-    reasoning_effort: str | None = None,
+    reasoning_effort: str = "minimal",
 ) -> str:
     """Single choke point for every Groq call: paces requests against the
     active model's real RPM/TPM budget (per console.groq.com/docs/rate-limits,
@@ -491,7 +550,13 @@ def _groq_chat(
     backs off using the server's Retry-After header instead of failing the
     whole pipeline run.
 
-    Also guards against gpt-oss models running out of max_tokens before
+    `reasoning_effort` is "minimal" by default ("low" for gpt-oss, "none" for
+    qwen — see _REASONING_EFFORT_BY_FAMILY) because every task in this file
+    is bounded structured-output generation, not open-ended problem solving.
+    Pass "default" for a call that genuinely benefits from more reasoning
+    room (currently just Portfolio's combination search).
+
+    Also guards against reasoning models running out of max_tokens before
     finishing their answer — signaled by finish_reason="length" — which can
     surface as either empty content (whole budget spent on hidden
     chain-of-thought) or non-empty-but-truncated content (e.g. a JSON object
@@ -513,12 +578,14 @@ def _groq_chat(
             max_tokens=max_tokens,
             messages=messages,
         )
-        if reasoning_effort and _REASONING_EFFORT_CAPABLE_SUBSTR in model:
-            # groq==0.11.0's typed create() signature predates gpt-oss support
-            # and has no `reasoning_effort` parameter — passing it as a direct
-            # kwarg raises TypeError. extra_body merges it straight into the
-            # raw JSON request instead, which this SDK version does support.
-            kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+        # groq==0.11.0's typed create() signature predates gpt-oss/qwen3.6
+        # reasoning support and has no `reasoning_effort` or `reasoning_format`
+        # parameters — passing them as direct kwargs raises TypeError.
+        # extra_body merges them straight into the raw JSON request instead,
+        # which this SDK version does support.
+        extra_body = _reasoning_extra_body(model, reasoning_effort)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         try:
             # with_raw_response gives us access to Groq's rate-limit headers
@@ -759,14 +826,16 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
 
     # This is the most reasoning-heavy call in the pipeline — it has to weigh
     # combinations across every safe candidate to hit an 8.0-13.0 combined-odds
-    # target. gpt-oss models can burn an entire small max_tokens budget on
-    # hidden chain-of-thought for a task like this and return empty content
-    # (finish_reason="length") even on a 200 OK. Giving it more room and a
-    # capped reasoning_effort makes that much less likely; _groq_chat's
-    # empty-content retry is the backstop if it still happens.
+    # target, so unlike every other call in this file it opts into "default"
+    # reasoning effort rather than "minimal" (maps to gpt-oss "medium" / qwen
+    # "default" — see _REASONING_EFFORT_BY_FAMILY). Reasoning models can still
+    # burn a max_tokens budget on chain-of-thought for a task like this and
+    # return empty/truncated content (finish_reason="length") even on a 200
+    # OK; giving it more room makes that less likely, and _groq_chat's
+    # truncation retry is the backstop if it still happens.
     text = _groq_chat(
         max_tokens=3000,
-        reasoning_effort="low",
+        reasoning_effort="default",
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
             {
