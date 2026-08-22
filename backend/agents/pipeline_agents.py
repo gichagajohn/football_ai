@@ -181,6 +181,34 @@ IMPORTANT OUTPUT RULES:
 - Respond with ONLY the JSON object. No markdown code fences, no commentary, no explanation before or after.
 - The response must be valid JSON that can be parsed directly with json.loads()."""
 
+# ---------------------------------------------------------------------------
+# Confidence threshold + edge margin — single source of truth.
+#
+# CONFIDENCE_THRESHOLD was a flat 0.70 baked into 6 separate places (3 prompt
+# strings + 3 code checks) — lowered here to a value the real, non-hallucinated
+# Analyst confidences can actually clear (observed distribution after fixing
+# the form/H2H/standings data gap: 0.50-0.66 across an 11-match batch, none
+# reaching 0.70). Tune via env without touching code or prompts.
+#
+# But a flat confidence floor is the wrong tool on its own regardless of
+# where it's set: the standard "value betting" rule (see e.g. Wheatcroft
+# 2020's level-stakes strategy, and the Kelly criterion literature more
+# generally) is to only bet when your estimated probability p̂ exceeds the
+# market's ODDS-IMPLIED probability (1/decimal_odds) — not any fixed
+# absolute number. A confidence of 0.60 is bad value on a double-chance pick
+# priced at 1.15 (implied ~87%) and good value on a BTTS pick priced at 2.20
+# (implied ~45%); one flat threshold can't distinguish those. Bookmakers also
+# bake in a margin (the "overround") on top of fair odds, so beating the
+# implied probability by ZERO isn't enough — MIN_EDGE_MARGIN requires
+# beating it by a buffer before a selection counts as real value.
+#
+# CONFIDENCE_THRESHOLD still gates the overall match (Risk/Decision) as a
+# floor on "is this match understood well enough at all", while
+# MIN_EDGE_MARGIN gates the specific MARKET Portfolio picks against real
+# odds (see run_portfolio) — they check different things and both matter.
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.60"))
+MIN_EDGE_MARGIN = float(os.environ.get("MIN_EDGE_MARGIN", "0.03"))
+
 ANALYST_PROMPT = """You are the ANALYST AGENT for Football Pulse AI.
 You receive clean match data and must estimate probabilities for each market.
 
@@ -228,6 +256,13 @@ about to output the same confidence you gave a previous match in this batch
 for materially different underlying stats, that's a sign you're anchoring
 rather than computing; go back and adjust based on the actual numbers.
 
+"confidence_calculation" must NEVER be an empty list, even when your final
+answer stays at the 0.50 base — in that case write the reason explicitly,
+e.g. "no adjustment — all of recent_form/head_to_head/standings were
+UNKNOWN" or "no adjustment — home and away stats were evenly balanced". A
+final confidence that differs from 0.50 with no entries explaining why is
+not acceptable output.
+
 Your analysis must be grounded in:
 - Recent form (last 5 results, weighted recency) — from recent_form, never invented
 - Head-to-head record (last 10 matches) — from head_to_head, never invented
@@ -239,7 +274,7 @@ Your analysis must be grounded in:
 Probabilities must sum to 1.0 for mutually exclusive markets (1X2).
 All values between 0.0 and 1.0.""" + JSON_RULES
 
-RISK_PROMPT = """You are the RISK AGENT for Football Pulse AI.
+RISK_PROMPT = f"""You are the RISK AGENT for Football Pulse AI.
 Your job is to REJECT dangerous selections.
 
 IMPORTANT CONTEXT: This assessment happens roughly 24-31 hours BEFORE kickoff
@@ -250,7 +285,7 @@ stage is NORMAL and EXPECTED, not a sign of danger. Do not reject a match
 for lacking lineup confirmation alone.
 
 HARD REJECT RULES (any one = instant reject):
-1. Adjusted confidence < 0.70
+1. Adjusted confidence < {CONFIDENCE_THRESHOLD:.2f}
 2. Both goalkeepers injured/suspended (confirmed injury, not lineup absence)
 3. Odds moved against our pick by >15% from open
 4. Weather: wind > 60 km/h or heavy snowfall forecast
@@ -266,9 +301,9 @@ SOFT FLAGS (reduce confidence, may still pass):
 - Long travel (>800km away)
 - Schedule congestion (3rd game in 8 days)
 
-Return JSON: {"approved": bool, "risk_level": "Low|Medium|High", "flags": [...], "rejection_reason": str|null}""" + JSON_RULES
+Return JSON: {{"approved": bool, "risk_level": "Low|Medium|High", "flags": [...], "rejection_reason": str|null}}""" + JSON_RULES
 
-PORTFOLIO_PROMPT = """You are the PORTFOLIO AGENT for Football Pulse AI.
+PORTFOLIO_PROMPT = f"""You are the PORTFOLIO AGENT for Football Pulse AI.
 Construct the optimal daily prediction ticket by SELECTING matches and markets only.
 
 You do NOT calculate odds yourself — odds will be looked up from the match data
@@ -283,6 +318,15 @@ NOT 10.0. To reach the ~10.0 target you will typically need a MIX:
 - 1-2 safer picks (Double Chance, Draw No Bet, odds ~1.1-1.4), AND
 - 2-3 higher-odds picks (BTTS, Over 2.5, or even an outright win for a
   team that is favoured but not overwhelmingly so, odds ~1.5-3.0)
+
+IMPORTANT — beyond hitting the odds target, the system will independently
+verify each selection has real "edge": your estimated probability for that
+exact market must exceed the market's odds-implied probability (1/odds) by
+at least a margin, or the system will drop it regardless of your rationale.
+So don't pick a market just because it's convenient for the combined-odds
+math — pick markets where your own markets{{}} probability for that outcome
+is meaningfully higher than what the odds imply. A selection you can't
+justify against the actual odds will be silently dropped downstream.
 
 Estimate the odds magnitude roughly yourself when selecting (you can see
 home_win/draw/away_win/btts_yes/over25 in each match's odds_snapshot) so
@@ -301,7 +345,7 @@ MARKET PREFERENCE (use these exact market keys):
 - btts_yes
 - over25 (Over 2.5 Goals — only use this key, not over15/under45 which cannot
   be priced from available odds data)
-- home_win / away_win (outright — only when confidence >= 0.70, and prefer
+- home_win / away_win (outright — only when confidence >= {CONFIDENCE_THRESHOLD:.2f}, and prefer
   the side that is favoured but still offers odds > 1.4)
 
 FORBIDDEN:
@@ -315,8 +359,8 @@ For each selection, output the fixture_id and the exact market key (must match o
 home_win, draw, away_win, btts_yes, over25, double_chance_home,
 double_chance_away, draw_no_bet_home, draw_no_bet_away).
 
-Output JSON: {"selections": [{"fixture_id": int, "market": str, "rationale": str}], "portfolio_confidence": float, "rationale": str}
-If you cannot build a combination likely to reach 8.0+, output: {"decision": "NO_BET", "reason": str}""" + JSON_RULES
+Output JSON: {{"selections": [{{"fixture_id": int, "market": str, "rationale": str}}], "portfolio_confidence": float, "rationale": str}}
+If you cannot build a combination likely to reach 8.0+, output: {{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
 
 AUDITOR_PROMPT = """You are the AUDITOR AGENT for Football Pulse AI.
 Act as the devil's advocate. Your job is to CHALLENGE every selection.
@@ -333,14 +377,14 @@ Adjust the confidence DOWN where warranted.
 
 Output JSON: {"adjusted_selections": [...], "overall_confidence_adjustment": float, "critical_flags": [...], "auditor_verdict": "APPROVE|REVISE|REJECT"}""" + JSON_RULES
 
-DECISION_PROMPT = """You are the DECISION AGENT for Football Pulse AI.
+DECISION_PROMPT = f"""You are the DECISION AGENT for Football Pulse AI.
 You receive the final audited ticket and make the publish/no-bet call.
 
 Note: combined_odds has already been computed deterministically from real
 bookmaker odds — you do not need to recalculate it, only check it falls in range.
 
 PUBLISH IF:
-- Overall confidence >= 0.70 (70%)
+- Overall confidence >= {CONFIDENCE_THRESHOLD:.2f} ({CONFIDENCE_THRESHOLD * 100:.0f}%)
 - Combined odds within 8.0-13.0
 - At least 2 selections passed auditor review
 - No HARD REJECT flags active
@@ -350,7 +394,7 @@ NO BET IF:
 - Any condition above fails
 - Gut-check: does this ticket look like disciplined value or desperate volume?
 
-Output JSON: {"decision": "PUBLISH|NO_BET", "reason": str, "final_confidence": float}""" + JSON_RULES
+Output JSON: {{"decision": "PUBLISH|NO_BET", "reason": str, "final_confidence": float}}""" + JSON_RULES
 
 PUBLISHER_PROMPT = """You are the PUBLISHER AGENT for Football Pulse AI.
 Format the final ticket for human-readable release as PLAIN TEXT (not JSON).
@@ -826,6 +870,22 @@ Return JSON:
             data["odds_snapshot"] = match.get("odds_snapshot", {})
             data["league"] = match.get("league")
             probabilities.append(data)
+
+            # Prompt compliance check — the model is instructed to never
+            # return an empty confidence_calculation, but instructions
+            # aren't guarantees (this exact gap showed up in production:
+            # Espanyol vs Real Madrid logged model_confidence=0.6 with
+            # calc: []). Flag it loudly rather than silently trusting an
+            # unexplained confidence value.
+            calc = data.get("confidence_calculation")
+            if not calc:
+                logger.warning(
+                    f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
+                    f"returned model_confidence={data.get('model_confidence')} with an "
+                    f"EMPTY confidence_calculation — prompt compliance gap, this "
+                    f"confidence value is unexplained and should not be trusted as-is."
+                )
+
             logger.info(
                 f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
                 f"— model_confidence={data.get('model_confidence')} "
@@ -975,6 +1035,34 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 f"({market}): could not derive valid odds from available data"
             )
             continue
+
+        # Real edge check (see the CONFIDENCE_THRESHOLD/MIN_EDGE_MARGIN
+        # comment above ANALYST_PROMPT for the reasoning): a flat confidence
+        # floor doesn't tell you whether a bet is actually good value against
+        # ITS specific odds. The Analyst already estimated a probability for
+        # this exact market in "markets" — compare that to what the real
+        # odds imply (1/odds) and require it to beat that by MIN_EDGE_MARGIN,
+        # the standard "value betting" rule. A selection that fails this is
+        # dropped here regardless of what Portfolio's rationale said, because
+        # Portfolio only sees odds_snapshot's raw 5 fields, not every derived
+        # market's true implied probability.
+        model_prob = (match.get("markets") or {}).get(market)
+        if model_prob is None:
+            skipped.append(
+                f"{match.get('home_team')} vs {match.get('away_team')} "
+                f"({market}): no Analyst-estimated probability available for this market"
+            )
+            continue
+        implied_prob = 1.0 / odds
+        edge = model_prob - implied_prob
+        if edge < MIN_EDGE_MARGIN:
+            skipped.append(
+                f"{match.get('home_team')} vs {match.get('away_team')} ({market}): "
+                f"no real edge — model {model_prob:.2f} vs market-implied {implied_prob:.2f} "
+                f"(edge {edge:+.2f} < required {MIN_EDGE_MARGIN:.2f})"
+            )
+            continue
+
         final_selections.append({
             "fixture_id": fixture_id,
             "home_team": match.get("home_team"),
@@ -982,6 +1070,9 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             "league": match.get("league"),
             "market": market,
             "odds": odds,
+            "model_prob": round(model_prob, 3),
+            "implied_prob": round(implied_prob, 3),
+            "edge": round(edge, 3),
             "rationale": sel.get("rationale", ""),
         })
 
@@ -1051,17 +1142,17 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     final_confidence = data.get("final_confidence")
     combined_odds = portfolio.get("combined_odds")
 
-    if final_confidence is not None and final_confidence < 0.70:
+    if final_confidence is not None and final_confidence < CONFIDENCE_THRESHOLD:
         if data.get("decision") == "PUBLISH":
             logger.warning(
                 f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
-                f"final_confidence={final_confidence} < 0.70"
+                f"final_confidence={final_confidence} < {CONFIDENCE_THRESHOLD:.2f}"
             )
         data["decision"] = "NO_BET"
         if "below" not in str(data.get("reason", "")).lower():
             data["reason"] = (
                 f"Overridden to NO_BET: final_confidence "
-                f"({final_confidence}) is below the 0.70 publish threshold. "
+                f"({final_confidence}) is below the {CONFIDENCE_THRESHOLD:.2f} publish threshold. "
                 f"Original reasoning: {data.get('reason', '')}"
             )
 
@@ -1092,7 +1183,7 @@ def run_publisher(portfolio: dict, decision: dict, audited: dict, target_date: s
 Reason: {decision.get('reason', 'Insufficient edge detected.')}
 
 The system found no selections meeting
-the 70%+ confidence threshold today.
+the {CONFIDENCE_THRESHOLD * 100:.0f}%+ confidence threshold today.
 
 Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
