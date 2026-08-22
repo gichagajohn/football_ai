@@ -13,7 +13,7 @@ from datetime import date
 import time
 
 import httpx
-from groq import Groq, RateLimitError
+from groq import Groq, NotFoundError, RateLimitError
 
 logger = logging.getLogger(__name__)
 # max_retries=0: we do our own TPM-aware pacing + retry (see _groq_chat below)
@@ -27,12 +27,18 @@ _token_usage_log: list[tuple[float, int]] = []
 
 # Model fallback chain: on a daily-quota 429 (RPD/TPD) we switch to the next
 # model rather than sleeping out a multi-minute daily cooldown, since each
-# model on Groq carries its own independent daily budget. See GROQ_MODEL
-# below for the primary model — this chain must start with it.
+# model on Groq carries its own independent daily budget.
+#
+# NOTE: Groq deprecates/retires models on short notice (llama-3.1-8b-instant
+# and llama-3.3-70b-versatile were both shut down Aug 16, 2026). If a model
+# here starts 404ing, check https://console.groq.com/docs/models for the
+# current lineup and update this list — the code below treats a 404 as
+# "unusable, skip it" rather than crashing, but a stale chain still means
+# fewer real fallback options in practice.
 GROQ_MODEL_FALLBACK_CHAIN = [
     "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
 ]
 _current_model_index = 0
 
@@ -48,7 +54,7 @@ def _switch_to_next_model() -> bool:
     _current_model_index += 1
     _token_usage_log.clear()
     logger.warning(
-        f"[FALLBACK] Daily quota hit on previous model — switching to {_current_model()}"
+        f"[FALLBACK] Switching to {_current_model()}"
     )
     return True
 
@@ -113,6 +119,13 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
             )
             time.sleep(wait)
             continue
+        except NotFoundError as e:
+            logger.error(f"[FALLBACK] {_current_model()} unavailable ({e}) — trying next model")
+            if _switch_to_next_model():
+                continue
+            raise RuntimeError(
+                f"Groq API: {_current_model()} unavailable and no fallback models remain"
+            ) from e
 
         usage = getattr(response, "usage", None)
         actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
