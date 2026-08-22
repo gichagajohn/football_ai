@@ -184,13 +184,57 @@ IMPORTANT OUTPUT RULES:
 ANALYST_PROMPT = """You are the ANALYST AGENT for Football Pulse AI.
 You receive clean match data and must estimate probabilities for each market.
 
+The match data includes real fields fetched from a stats API:
+- recent_form.home / recent_form.away: {"results": "WLDWW" (most recent
+  first), "goals_for", "goals_against"} from each team's real last 5
+  finished matches, or {} if genuinely unavailable
+- head_to_head: {"matches_played", "home_wins", "draws", "away_wins"} from
+  the real last-10-meetings record, or {} if unavailable
+- standings.home / standings.away: {"position", "points", "goal_diff"} from
+  the real current league table, or {} if unavailable
+
+These are the ONLY source of "recent form", "head-to-head record", and
+"league position" — you do not have any other source for them, and you must
+never invent a plausible-looking form string, W-D-L record, or standings gap
+that isn't present in the data. If a field is {} (empty), that specific
+input is UNKNOWN — treat it as missing information, not as neutral/average
+form, and do not silently substitute a guess.
+
+Before scoring, you MUST fill in "supporting_stats" (see schema below)
+restating the ACTUAL values you were given for each factor — copy them, do
+not paraphrase or round them. This is required even when a factor is
+UNKNOWN; write "UNKNOWN" for that key rather than omitting it. A
+"supporting_stats" entry that doesn't match what was in the raw data is
+treated as a hallucination.
+
+Then compute model_confidence as an explicit calculation, not a single
+freeform number:
+1. Start from a base of 0.50.
+2. Adjust up/down based ONLY on the supporting_stats you just cited —
+   e.g. clear form advantage, H2H dominance, standings gap, confirmed
+   injuries to key players. State each adjustment and its direction/size
+   in "confidence_calculation" (a short list of strings like
+   "+0.08 home team 4W-1D in last 5 vs away 1W-3L-1D").
+3. If two or more of recent_form/head_to_head/standings came back UNKNOWN
+   for this match, cap your final model_confidence at 0.60 — insufficient
+   real data to justify higher confidence than that, regardless of odds or
+   general impression of the teams.
+4. Sum the adjustments onto the base for the final model_confidence.
+
+Do NOT default to a "safe-sounding" round number (0.65, 0.70, 0.75) out of
+habit. Two different matches with genuinely different supporting_stats
+should produce genuinely different confidence values — if you notice you're
+about to output the same confidence you gave a previous match in this batch
+for materially different underlying stats, that's a sign you're anchoring
+rather than computing; go back and adjust based on the actual numbers.
+
 Your analysis must be grounded in:
-- Recent form (last 5 results, weighted recency)
-- Head-to-head record (last 10 matches)
+- Recent form (last 5 results, weighted recency) — from recent_form, never invented
+- Head-to-head record (last 10 matches) — from head_to_head, never invented
 - xG data (if available)
 - Home/away performance splits
 - Injuries to key players (striker out = lower over 2.5 probability)
-- League position and points gap
+- League position and points gap — from standings, never invented
 
 Probabilities must sum to 1.0 for mutually exclusive markets (1X2).
 All values between 0.0 and 1.0.""" + JSON_RULES
@@ -729,8 +773,12 @@ def _valid(odds: float | None) -> float | None:
 def run_analyst(clean_matches: list[dict]) -> list[dict]:
     probabilities = []
     for i, match in enumerate(clean_matches):
+        # max_tokens bumped 1500 -> 2000: the ANALYST_PROMPT now also asks
+        # for "supporting_stats" (the real form/H2H/standings figures cited
+        # back) and "confidence_calculation" (the itemized adjustments), so
+        # the expected output is meaningfully longer than before.
         text = _groq_chat(
-            max_tokens=1500,
+            max_tokens=2000,
             messages=[
                 {"role": "system", "content": ANALYST_PROMPT},
                 {
@@ -743,6 +791,13 @@ Return JSON:
   "fixture_id": int,
   "home_team": str,
   "away_team": str,
+  "supporting_stats": {{
+    "home_form": str,
+    "away_form": str,
+    "head_to_head": str,
+    "standings_gap": str,
+    "key_injuries": str
+  }},
   "markets": {{
     "home_win": float,
     "draw": float,
@@ -757,6 +812,7 @@ Return JSON:
     "draw_no_bet_away": float
   }},
   "key_factors": [str],
+  "confidence_calculation": [str],
   "model_confidence": float
 }}"""
                 }
@@ -772,13 +828,36 @@ Return JSON:
             probabilities.append(data)
             logger.info(
                 f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
-                f"— model_confidence={data.get('model_confidence')}"
+                f"— model_confidence={data.get('model_confidence')} "
+                f"(calc: {data.get('confidence_calculation')})"
             )
         else:
             logger.error(
                 f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
                 f"(finish_reason={_last_finish_reason}): {text[:200]}"
             )
+
+    # Cheap automated check for the exact anchoring pattern observed earlier:
+    # many genuinely different matches all landing on the same confidence.
+    # This doesn't fix a bad batch, but it surfaces the signal in logs
+    # immediately instead of requiring someone to eyeball the run afterward.
+    if len(probabilities) >= 3:
+        from collections import Counter
+        counts = Counter(
+            round(p["model_confidence"], 2)
+            for p in probabilities
+            if isinstance(p.get("model_confidence"), (int, float))
+        )
+        if counts:
+            common_value, common_count = counts.most_common(1)[0]
+            if common_count / len(probabilities) >= 0.5:
+                logger.warning(
+                    f"[ANALYST] {common_count}/{len(probabilities)} matches share the same "
+                    f"model_confidence ({common_value}) this run — possible anchoring rather "
+                    f"than genuine differentiation. Check each match's supporting_stats/"
+                    f"confidence_calculation to confirm they're actually distinct."
+                )
+
     return probabilities
 
 
@@ -786,8 +865,16 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
     safe = []
     for i, prob in enumerate(probabilities):
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
+        # NOTE ON max_tokens=900 (was 600): 600 was consistently too tight —
+        # every Risk call in the previous run hit finish_reason="length" on
+        # its FIRST attempt and had to retry at 1200, which costs a full
+        # extra round trip *and* a second _pace_before_call wait on top of
+        # it. 900 covers the observed real output size (flags array +
+        # rejection_reason text) without needing the retry in the common
+        # case, and the truncation-retry path is still there as a backstop
+        # if a particular match's flags list runs long.
         text = _groq_chat(
-            max_tokens=600,
+            max_tokens=900,
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
                 {
@@ -828,13 +915,17 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     # combinations across every safe candidate to hit an 8.0-13.0 combined-odds
     # target, so unlike every other call in this file it opts into "default"
     # reasoning effort rather than "minimal" (maps to gpt-oss "medium" / qwen
-    # "default" — see _REASONING_EFFORT_BY_FAMILY). Reasoning models can still
-    # burn a max_tokens budget on chain-of-thought for a task like this and
-    # return empty/truncated content (finish_reason="length") even on a 200
-    # OK; giving it more room makes that less likely, and _groq_chat's
-    # truncation retry is the backstop if it still happens.
+    # "default" — see _REASONING_EFFORT_BY_FAMILY).
+    #
+    # NOTE ON max_tokens=4000 (was 3000): the last run hit finish_reason=
+    # "length" with EMPTY content at 3000 (whole budget spent before any
+    # visible output), forcing a retry at 6000. 4000 gives "default"
+    # reasoning effort more breathing room to actually reach visible output
+    # on the first attempt for the common case (2-5 selections), while the
+    # existing truncation retry still climbs to the 6000 ceiling if a
+    # particular candidate set needs it.
     text = _groq_chat(
-        max_tokens=3000,
+        max_tokens=4000,
         reasoning_effort="default",
         messages=[
             {"role": "system", "content": PORTFOLIO_PROMPT},
