@@ -12,15 +12,11 @@ from typing import Any
 from groq import Groq
 
 logger = logging.getLogger(__name__)
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=8)
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# Model: llama-3.1-8b-instant — 20,000 TPM free tier, avoids 429s from openai/gpt-oss-120b (8,000 TPM)
-GROQ_MODEL = "openai/gpt-oss-20b"
-
-# openai/gpt-oss-20b's real ceiling is 8,000 TPM (tokens/minute), shared across
-# the whole pipeline — much tighter than the RPM cap. 12s between calls keeps
-# us comfortably under it; max_retries=8 on the client absorbs the rest.
-GROQ_CALL_DELAY_SECONDS = 12
+# Model: llama-3.1-8b-instant — 20,000 TPM free tier
+GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_CALL_DELAY_SECONDS = 6
 
 JSON_RULES = """
 
@@ -53,7 +49,7 @@ stage is NORMAL and EXPECTED, not a sign of danger. Do not reject a match
 for lacking lineup confirmation alone.
 
 HARD REJECT RULES (any one = instant reject):
-1. Adjusted confidence < 0.80
+1. Adjusted confidence < 0.70
 2. Both goalkeepers injured/suspended (confirmed injury, not lineup absence)
 3. Odds moved against our pick by >15% from open
 4. Weather: wind > 60 km/h or heavy snowfall forecast
@@ -104,7 +100,7 @@ MARKET PREFERENCE (use these exact market keys):
 - btts_yes
 - over25 (Over 2.5 Goals — only use this key, not over15/under45 which cannot
   be priced from available odds data)
-- home_win / away_win (outright — only when confidence >= 0.80, and prefer
+- home_win / away_win (outright — only when confidence >= 0.70, and prefer
   the side that is favoured but still offers odds > 1.4)
 
 FORBIDDEN:
@@ -143,7 +139,7 @@ Note: combined_odds has already been computed deterministically from real
 bookmaker odds — you do not need to recalculate it, only check it falls in range.
 
 PUBLISH IF:
-- Overall confidence >= 0.78 (78%)
+- Overall confidence >= 0.70 (70%)
 - Combined odds within 8.0-13.0
 - At least 2 selections passed auditor review
 - No HARD REJECT flags active
@@ -317,11 +313,9 @@ Return JSON:
                 f"— model_confidence={data.get('model_confidence')}"
             )
         else:
-            logger.error(
-                f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
-                f"(len={len(text or '')}): {text[:300]!r}"
-            )
-        time.sleep(GROQ_CALL_DELAY_SECONDS)
+            logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
+        if i < len(clean_matches) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return probabilities
 
 
@@ -331,7 +325,7 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
         response = client.chat.completions.create(
             model=GROQ_MODEL,
-            max_tokens=1200,
+            max_tokens=600,
             messages=[
                 {"role": "system", "content": RISK_PROMPT},
                 {
@@ -343,23 +337,22 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         text = response.choices[0].message.content
         risk_data = _extract_json(text)
         if not risk_data:
-            logger.error(
-                f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"(len={len(text or '')}): {text[:300]!r}"
-            )
+            logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
         elif risk_data.get("approved"):
             prob["risk_assessment"] = risk_data
             safe.append(prob)
             logger.info(
                 f"[RISK] Approved: {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"— risk_level={risk_data.get('risk_level')}"
+                f"— risk={risk_data.get('risk_level')}"
             )
         else:
             logger.info(
                 f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"— model_confidence={prob.get('model_confidence')} — {risk_data.get('rejection_reason')}"
+                f"— model_confidence={prob.get('model_confidence')} "
+                f"— {risk_data.get('rejection_reason')}"
             )
-        time.sleep(GROQ_CALL_DELAY_SECONDS)
+        if i < len(probabilities) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
     return safe
 
 
@@ -380,7 +373,6 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             }
         ]
     )
-    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
@@ -457,7 +449,6 @@ def run_auditor(portfolio: dict) -> dict:
             }
         ]
     )
-    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
@@ -475,7 +466,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
-        max_tokens=900,
+        max_tokens=400,
         messages=[
             {"role": "system", "content": DECISION_PROMPT},
             {
@@ -484,29 +475,35 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
             }
         ]
     )
-    time.sleep(GROQ_CALL_DELAY_SECONDS)
     text = response.choices[0].message.content
     data = _extract_json(text)
     if not data:
-        logger.error(f"Decision parse error (len={len(text or '')}): {text[:300]!r}")
+        logger.error(f"Decision parse error: {text[:200]}")
         return {"decision": "NO_BET", "reason": "Decision agent error — defaulting safe.", "final_confidence": 0.0}
 
     final_confidence = data.get("final_confidence")
     combined_odds = portfolio.get("combined_odds")
 
-    if final_confidence is not None and final_confidence < 0.78:
+    if final_confidence is not None and final_confidence < 0.70:
         if data.get("decision") == "PUBLISH":
-            logger.warning(f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: final_confidence={final_confidence} < 0.78")
+            logger.warning(
+                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
+                f"final_confidence={final_confidence} < 0.70"
+            )
         data["decision"] = "NO_BET"
         if "below" not in str(data.get("reason", "")).lower():
             data["reason"] = (
-                f"Overridden to NO_BET: final_confidence ({final_confidence}) is below the 0.78 publish threshold. "
+                f"Overridden to NO_BET: final_confidence "
+                f"({final_confidence}) is below the 0.70 publish threshold. "
                 f"Original reasoning: {data.get('reason', '')}"
             )
 
     if combined_odds is not None and not (8.0 <= combined_odds <= 13.0):
         if data.get("decision") == "PUBLISH":
-            logger.warning(f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: combined_odds={combined_odds} outside 8.0-13.0 range")
+            logger.warning(
+                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
+                f"combined_odds={combined_odds} outside 8.0-13.0 range"
+            )
         data["decision"] = "NO_BET"
         data["reason"] = (
             f"Overridden to NO_BET: combined_odds ({combined_odds}) is outside "
@@ -528,7 +525,7 @@ def run_publisher(portfolio: dict, decision: dict, audited: dict, target_date: s
 Reason: {decision.get('reason', 'Insufficient edge detected.')}
 
 The system found no selections meeting
-the 80%+ confidence threshold today.
+the 70%+ confidence threshold today.
 
 Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
