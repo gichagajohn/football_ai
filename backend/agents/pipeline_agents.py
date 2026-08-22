@@ -1,495 +1,193 @@
 """
-SCOUT AGENT — Football Pulse AI (GitHub Actions edition)
-Pulls fixtures, odds, form, injuries, lineups, weather, travel, market movement.
+ANALYST / RISK / PORTFOLIO / AUDITOR / DECISION / PUBLISHER AGENTS — Football Pulse AI
 """
 
-import asyncio
 import json
 import logging
 import os
 import re
-from datetime import date
+import time
+from typing import Any
 
-import httpx
 from groq import Groq
 
 logger = logging.getLogger(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-DEFAULT_LEAGUE_IDS = {
-    "PL": "Premier League",
-    "PD": "La Liga",
-    "BL1": "Bundesliga",
-    "SA": "Serie A",
-    "FL1": "Ligue 1",
-    "CL": "UEFA Champions League",
-}
-
-KNOWN_LEAGUE_NAMES = {
-    **DEFAULT_LEAGUE_IDS,
-    "DED": "Eredivisie",
-    "PPL": "Primeira Liga",
-    "ELC": "Championship (England)",
-    "BSA": "Campeonato Brasileiro Série A",
-    "WC": "FIFA World Cup",
-    "EC": "European Championship",
-}
-
-ODDS_SPORT_KEYS = {
-    "PL": "soccer_epl",
-    "PD": "soccer_spain_la_liga",
-    "BL1": "soccer_germany_bundesliga",
-    "SA": "soccer_italy_serie_a",
-    "FL1": "soccer_france_ligue_one",
-    "CL": "soccer_uefa_champs_league",
-}
-
-FPL_NAME_ALIASES = {
-    "Nott'm Forest": "Nottingham Forest",
-    "Spurs": "Tottenham Hotspur",
-    "Man Utd": "Manchester United",
-    "Man City": "Manchester City",
-    "Newcastle": "Newcastle United",
-    "Leeds": "Leeds United",
-    "Wolves": "Wolverhampton Wanderers",
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Home city lookup — used when football-data.org doesn't return a venue city.
-# Keys are lowercased team name fragments so partial matches work too.
-# ─────────────────────────────────────────────────────────────────────────────
-TEAM_HOME_CITY: dict[str, str] = {
-    # Premier League
-    "arsenal": "London",
-    "chelsea": "London",
-    "tottenham": "London",
-    "spurs": "London",
-    "west ham": "London",
-    "crystal palace": "London",
-    "fulham": "London",
-    "brentford": "London",
-    "wimbledon": "London",
-    "charlton": "London",
-    "millwall": "London",
-    "manchester city": "Manchester",
-    "manchester united": "Manchester",
-    "liverpool": "Liverpool",
-    "everton": "Liverpool",
-    "newcastle": "Newcastle upon Tyne",
-    "sunderland": "Sunderland",
-    "aston villa": "Birmingham",
-    "birmingham": "Birmingham",
-    "wolverhampton": "Wolverhampton",
-    "wolves": "Wolverhampton",
-    "west bromwich": "West Bromwich",
-    "leicester": "Leicester",
-    "nottingham": "Nottingham",
-    "derby": "Derby",
-    "sheffield united": "Sheffield",
-    "sheffield wednesday": "Sheffield",
-    "leeds": "Leeds",
-    "burnley": "Burnley",
-    "bolton": "Bolton",
-    "blackburn": "Blackburn",
-    "brighton": "Brighton",
-    "southampton": "Southampton",
-    "portsmouth": "Portsmouth",
-    "watford": "Watford",
-    "luton": "Luton",
-    "norwich": "Norwich",
-    "ipswich": "Ipswich",
-    "coventry": "Coventry",
-    "stoke": "Stoke-on-Trent",
-    "middlesbrough": "Middlesbrough",
-    "swansea": "Swansea",
-    "cardiff": "Cardiff",
-    # La Liga
-    "real madrid": "Madrid",
-    "atletico madrid": "Madrid",
-    "atletico de madrid": "Madrid",
-    "getafe": "Madrid",
-    "rayo vallecano": "Madrid",
-    "barcelona": "Barcelona",
-    "espanyol": "Barcelona",
-    "valencia": "Valencia",
-    "villarreal": "Villarreal",
-    "sevilla": "Seville",
-    "real betis": "Seville",
-    "athletic bilbao": "Bilbao",
-    "athletic club": "Bilbao",
-    "real sociedad": "San Sebastian",
-    "osasuna": "Pamplona",
-    "deportivo alaves": "Vitoria-Gasteiz",
-    "alaves": "Vitoria-Gasteiz",
-    "celta vigo": "Vigo",
-    "malaga": "Malaga",
-    "granada": "Granada",
-    "real valladolid": "Valladolid",
-    "cadiz": "Cadiz",
-    "almeria": "Almeria",
-    "girona": "Girona",
-    "las palmas": "Las Palmas",
-    "leganes": "Leganes",
-    # Bundesliga
-    "bayern munich": "Munich",
-    "fc bayern": "Munich",
-    "borussia dortmund": "Dortmund",
-    "bvb": "Dortmund",
-    "rb leipzig": "Leipzig",
-    "bayer leverkusen": "Leverkusen",
-    "borussia monchengladbach": "Monchengladbach",
-    "eintracht frankfurt": "Frankfurt",
-    "sc freiburg": "Freiburg",
-    "vfb stuttgart": "Stuttgart",
-    "stuttgar": "Stuttgart",
-    "wolfsburg": "Wolfsburg",
-    "werder bremen": "Bremen",
-    "hamburger": "Hamburg",
-    "hertha berlin": "Berlin",
-    "union berlin": "Berlin",
-    "schalke": "Gelsenkirchen",
-    "augsburg": "Augsburg",
-    "mainz": "Mainz",
-    "hoffenheim": "Sinsheim",
-    "koln": "Cologne",
-    "fc koln": "Cologne",
-    "cologne": "Cologne",
-    "heidenheim": "Heidenheim",
-    "darmstadt": "Darmstadt",
-    # Serie A
-    "juventus": "Turin",
-    "torino": "Turin",
-    "ac milan": "Milan",
-    "inter milan": "Milan",
-    "internazionale": "Milan",
-    "como": "Como",
-    "as roma": "Rome",
-    "lazio": "Rome",
-    "napoli": "Naples",
-    "atalanta": "Bergamo",
-    "fiorentina": "Florence",
-    "bologna": "Bologna",
-    "genoa": "Genoa",
-    "sampdoria": "Genoa",
-    "udinese": "Udine",
-    "cagliari": "Cagliari",
-    "sassuolo": "Sassuolo",
-    "empoli": "Empoli",
-    "lecce": "Lecce",
-    "frosinone": "Frosinone",
-    "monza": "Monza",
-    "hellas verona": "Verona",
-    "venezia": "Venice",
-    "parma": "Parma",
-    # Ligue 1
-    "psg": "Paris",
-    "paris saint-germain": "Paris",
-    "paris saint germain": "Paris",
-    "olympique de marseille": "Marseille",
-    "marseille": "Marseille",
-    "olympique lyonnais": "Lyon",
-    "lyon": "Lyon",
-    "monaco": "Monaco",
-    "nice": "Nice",
-    "stade rennais": "Rennes",
-    "rennes": "Rennes",
-    "lille": "Lille",
-    "montpellier": "Montpellier",
-    "nantes": "Nantes",
-    "strasbourg": "Strasbourg",
-    "toulouse": "Toulouse",
-    "reims": "Reims",
-    "lens": "Lens",
-    "brest": "Brest",
-    "auxerre": "Auxerre",
-    "angers": "Angers",
-    "le havre": "Le Havre",
-    "clermont": "Clermont-Ferrand",
-    "metz": "Metz",
-    "lorient": "Lorient",
-    "saint-etienne": "Saint-Etienne",
-    # Eredivisie
-    "ajax": "Amsterdam",
-    "psv": "Eindhoven",
-    "feyenoord": "Rotterdam",
-    "az alkmaar": "Alkmaar",
-    "az": "Alkmaar",
-    "vitesse": "Arnhem",
-    "utrecht": "Utrecht",
-    "twente": "Enschede",
-    # Primeira Liga
-    "benfica": "Lisbon",
-    "sporting cp": "Lisbon",
-    "porto": "Porto",
-    "braga": "Braga",
-    "vitoria guimaraes": "Guimaraes",
-    # World Cup / international — use host city where known
-    "united states": "New York",
-    "usa": "New York",
-    "mexico": "Mexico City",
-    "canada": "Toronto",
-    "brazil": "Rio de Janeiro",
-    "argentina": "Buenos Aires",
-    "germany": "Berlin",
-    "france": "Paris",
-    "england": "London",
-    "spain": "Madrid",
-    "italy": "Rome",
-    "portugal": "Lisbon",
-    "netherlands": "Amsterdam",
-    "belgium": "Brussels",
-    "morocco": "Casablanca",
-    "senegal": "Dakar",
-    "nigeria": "Lagos",
-    "egypt": "Cairo",
-    "japan": "Tokyo",
-    "south korea": "Seoul",
-    "australia": "Sydney",
-}
-
-
-def _get_venue_city(home_team_name: str) -> str | None:
-    """
-    Look up a home city for the given team name using the TEAM_HOME_CITY table.
-    Uses case-insensitive substring matching so partial names work too.
-    """
-    name_lower = home_team_name.lower().strip()
-    # Try exact match first
-    if name_lower in TEAM_HOME_CITY:
-        return TEAM_HOME_CITY[name_lower]
-    # Try substring match
-    for key, city in TEAM_HOME_CITY.items():
-        if key in name_lower or name_lower in key:
-            return city
-    return None
-
-
-# Model in use — openai/gpt-oss-20b has 20,000 TPM on the free tier.
+# Model: openai/gpt-oss-20b — 20,000 TPM free tier
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_CALL_DELAY_SECONDS = 6
 
-
-def _load_league_ids() -> dict[str, str]:
-    override = os.environ.get("LEAGUE_IDS", "").strip()
-    if not override:
-        return DEFAULT_LEAGUE_IDS
-    codes = [part.strip().upper() for part in override.split(",") if part.strip()]
-    if not codes:
-        logger.warning("[SCOUT] LEAGUE_IDS was set but contained no valid codes — falling back to default top-5+UCL.")
-        return DEFAULT_LEAGUE_IDS
-    result = {c: KNOWN_LEAGUE_NAMES.get(c, f"Competition {c}") for c in codes}
-    logger.info(f"[SCOUT] LEAGUE_IDS override active — using {len(result)} competition(s): {list(result.values())}")
-    return result
-
-
-TOP_LEAGUE_IDS = _load_league_ids()
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = os.environ.get(name, "")
-    raw = raw.strip() if raw else ""
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning(f"[SCOUT] Env var {name}='{raw}' is not a valid float — using default {default}.")
-        return default
-
-
-CLEANER_THRESHOLD_ENV = _float_env("CLEANER_THRESHOLD", 0.5)
-MAX_MATCHES_PER_DAY = 12
-FALLBACK_BATCH_SIZE = 6
-
-SYSTEM_PROMPT = """You are the SCOUT AGENT for Football Pulse AI.
-Your job is to gather and structure football match intelligence.
-
-IMPORTANT TIMING CONTEXT: You are analyzing matches roughly 24-31 hours
-before kickoff (this runs once daily, the morning before matchday).
-Official lineups are almost NEVER confirmed this far ahead — they
-typically post about 1 hour before kickoff. An unconfirmed lineup at
-this stage is NORMAL, not a data quality problem.
-
-Given raw data from APIs and web sources, you:
-1. Extract the most relevant fixtures for today + next 24h
-2. Identify key injury/suspension concerns
-3. Flag meaningful odds movements (>10% from open)
-4. Note travel distances >500km for away teams
-5. Assess weather risk (heavy rain, wind >50km/h, extreme cold)
-6. Note lineup status as informational only (expected to be unconfirmed
-   at this stage — this is not itself a red flag)
+JSON_RULES = """
 
 IMPORTANT OUTPUT RULES:
 - Respond with ONLY the JSON object. No markdown code fences, no commentary, no explanation before or after.
-- data_completeness must be a float between 0.0 and 1.0 reflecting how much real data you actually received
-  (team names, odds present, injury reports present, weather present). Do NOT penalize completeness for
-  lineups being unconfirmed — that's expected at this stage, not missing data. If odds/injuries/weather
-  are genuinely missing/UNKNOWN, data_completeness should be LOW (e.g. 0.3-0.5); lineup status has no
-  bearing on this score.
-- Never hallucinate injury or lineup data — if unknown, state 'UNKNOWN'."""
+- The response must be valid JSON that can be parsed directly with json.loads()."""
 
+ANALYST_PROMPT = """You are the ANALYST AGENT for Football Pulse AI.
+You receive clean match data and must estimate probabilities for each market.
 
-FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+Your analysis must be grounded in:
+- Recent form (last 5 results, weighted recency)
+- Head-to-head record (last 10 matches)
+- xG data (if available)
+- Home/away performance splits
+- Injuries to key players (striker out = lower over 2.5 probability)
+- League position and points gap
 
+Probabilities must sum to 1.0 for mutually exclusive markets (1X2).
+All values between 0.0 and 1.0.""" + JSON_RULES
 
-async def fetch_fixtures(target_date: date) -> list[dict]:
-    all_matches = []
-    date_str = target_date.isoformat()
-    async with httpx.AsyncClient(timeout=30) as http:
-        for code, league_name in TOP_LEAGUE_IDS.items():
-            try:
-                resp = await http.get(
-                    f"{FOOTBALL_DATA_BASE}/competitions/{code}/matches",
-                    headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
-                    params={"dateFrom": date_str, "dateTo": date_str},
-                )
-                resp.raise_for_status()
-                matches = resp.json().get("matches", [])
-                for m in matches:
-                    m["_competition_code"] = code
-                if matches:
-                    logger.info(f"[SCOUT] {league_name}: {len(matches)} fixture(s) found.")
-                all_matches.extend(matches)
-            except Exception as e:
-                logger.warning(f"[SCOUT] Fixture fetch failed for {league_name}: {e}")
-            await asyncio.sleep(1)
-    return all_matches
+RISK_PROMPT = """You are the RISK AGENT for Football Pulse AI.
+Your job is to REJECT dangerous selections.
 
+IMPORTANT CONTEXT: This assessment happens roughly 24-31 hours BEFORE kickoff
+(the pipeline runs once daily, the morning before matchday). Official lineups
+are almost never confirmed this far in advance — they typically come out
+about 1 hour before kickoff. Therefore "lineup not yet confirmed" at this
+stage is NORMAL and EXPECTED, not a sign of danger. Do not reject a match
+for lacking lineup confirmation alone.
 
-async def fetch_league_odds(sport_key: str) -> list[dict]:
-    async with httpx.AsyncClient(timeout=20) as http:
-        try:
-            resp = await http.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-                params={
-                    "apiKey": os.environ.get("ODDS_API_KEY", ""),
-                    "regions": "eu",
-                    "markets": "h2h,totals",
-                    "oddsFormat": "decimal",
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.warning(f"[SCOUT] Odds fetch failed for {sport_key}: {e}")
-            return []
+HARD REJECT RULES (any one = instant reject):
+1. Adjusted confidence < 0.70
+2. Both goalkeepers injured/suspended (confirmed injury, not lineup absence)
+3. Odds moved against our pick by >15% from open
+4. Weather: wind > 60 km/h or heavy snowfall forecast
+5. Cup/playoff match with strong rotation signals (e.g. team already through,
+   dead-rubber group match, manager has publicly stated rotation intent)
+6. Team with 3+ key attackers injured/suspended (affects goals markets)
 
+SOFT FLAGS (reduce confidence, may still pass):
+- Lineup not yet confirmed (expected at this stage — note it, don't reject for it)
+- Odds moved against pick by 8-15%
+- One key player injured
+- Minor weather concerns
+- Long travel (>800km away)
+- Schedule congestion (3rd game in 8 days)
 
-def _normalize_team_name(name: str) -> str:
-    name = name.strip()
-    for suffix in (" FC", " CF", " AFC", " CD", " SD", " AC"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-    name = name.replace("&", "and")
-    name = re.sub(r"\s+", " ", name)
-    return name.strip().lower()
+Return JSON: {"approved": bool, "risk_level": "Low|Medium|High", "flags": [...], "rejection_reason": str|null}""" + JSON_RULES
 
+PORTFOLIO_PROMPT = """You are the PORTFOLIO AGENT for Football Pulse AI.
+Construct the optimal daily prediction ticket by SELECTING matches and markets only.
 
-def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
-    home_norm = _normalize_team_name(home_name)
-    away_norm = _normalize_team_name(away_name)
-    for event in odds_events:
-        eh = _normalize_team_name(event.get("home_team", ""))
-        ea = _normalize_team_name(event.get("away_team", ""))
-        if (eh in home_norm or home_norm in eh) and (ea in away_norm or away_norm in ea):
-            return event
-    return {}
+You do NOT calculate odds yourself — odds will be looked up from the match data
+by the system after you choose. Focus purely on WHICH match + market combinations
+to select.
 
+TARGET: combined odds of approximately 10.0 (acceptable range: 8.0-13.0).
 
-def _extract_odds_snapshot(odds_event: dict) -> dict:
-    snapshot = {}
-    bookmakers = odds_event.get("bookmakers", [])
-    if not bookmakers:
-        return snapshot
-    book = bookmakers[0]
-    home_team = odds_event.get("home_team")
-    away_team = odds_event.get("away_team")
-    for market in book.get("markets", []):
-        if market.get("key") == "h2h":
-            for outcome in market.get("outcomes", []):
-                name = outcome.get("name", "")
-                if name == home_team:
-                    snapshot["home_win"] = outcome.get("price")
-                elif name == away_team:
-                    snapshot["away_win"] = outcome.get("price")
-                elif name.lower() == "draw":
-                    snapshot["draw"] = outcome.get("price")
-        elif market.get("key") == "totals":
-            for outcome in market.get("outcomes", []):
-                if outcome.get("point") == 2.5 and outcome.get("name", "").lower() == "over":
-                    snapshot["over25"] = outcome.get("price")
-    return snapshot
+IMPORTANT — Double Chance markets typically have odds between 1.05 and 1.35.
+Multiplying 3-4 Double Chance picks together usually only reaches 1.3-2.5,
+NOT 10.0. To reach the ~10.0 target you will typically need a MIX:
+- 1-2 safer picks (Double Chance, Draw No Bet, odds ~1.1-1.4), AND
+- 2-3 higher-odds picks (BTTS, Over 2.5, or even an outright win for a
+  team that is favoured but not overwhelmingly so, odds ~1.5-3.0)
 
+Estimate the odds magnitude roughly yourself when selecting (you can see
+home_win/draw/away_win/btts_yes/over25 in each match's odds_snapshot) so
+your final selection set multiplies to roughly 8-13. The system will
+compute the EXACT final odds — your job is just to pick a sensible
+combination that's likely to land in range.
 
-async def fetch_epl_injuries() -> dict[str, list[dict]]:
-    async with httpx.AsyncClient(timeout=15) as http:
-        try:
-            resp = await http.get("https://fantasy.premierleague.com/api/bootstrap-static/")
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning(f"[SCOUT] FPL injury fetch failed: {e}")
-            return {}
+RULES:
+- Selections: 2-5 only
+- Prefer matches where model_confidence is highest
+- If you cannot construct a combination likely to reach 8.0+, output decision NO_BET
 
-    teams_by_id = {t["id"]: t["name"] for t in data.get("teams", [])}
-    injuries_by_team: dict[str, list[dict]] = {}
-    for player in data.get("elements", []):
-        if player.get("status") == "a":
-            continue
-        team_name = teams_by_id.get(player.get("team"))
-        if not team_name:
-            continue
-        injuries_by_team.setdefault(team_name, []).append(
-            {
-                "player": player.get("web_name"),
-                "status": player.get("status"),
-                "news": player.get("news") or "No details provided",
-                "chance_of_playing_next_round": player.get("chance_of_playing_next_round"),
-            }
-        )
-    return injuries_by_team
+MARKET PREFERENCE (use these exact market keys):
+- double_chance_home / double_chance_away
+- draw_no_bet_home / draw_no_bet_away
+- btts_yes
+- over25 (Over 2.5 Goals — only use this key, not over15/under45 which cannot
+  be priced from available odds data)
+- home_win / away_win (outright — only when confidence >= 0.70, and prefer
+  the side that is favoured but still offers odds > 1.4)
 
+FORBIDDEN:
+- Correct score markets
+- First goalscorer
+- Asian handicap
+- Combining two volatile markets from the same match
+- over15 and under45 (cannot be priced — do not select these)
 
-def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict]:
-    target = _normalize_team_name(fd_team_name)
-    for fpl_name, injuries in injuries_by_team.items():
-        candidate = _normalize_team_name(FPL_NAME_ALIASES.get(fpl_name, fpl_name))
-        if candidate == target or candidate in target or target in candidate:
-            return injuries
-    return []
+For each selection, output the fixture_id and the exact market key (must match one of:
+home_win, draw, away_win, btts_yes, over25, double_chance_home,
+double_chance_away, draw_no_bet_home, draw_no_bet_away).
 
+Output JSON: {"selections": [{"fixture_id": int, "market": str, "rationale": str}], "portfolio_confidence": float, "rationale": str}
+If you cannot build a combination likely to reach 8.0+, output: {"decision": "NO_BET", "reason": str}""" + JSON_RULES
 
-async def fetch_weather(venue_city: str | None) -> dict:
-    if not venue_city:
-        logger.info("[SCOUT] No venue city — skipping weather fetch.")
-        return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
+AUDITOR_PROMPT = """You are the AUDITOR AGENT for Football Pulse AI.
+Act as the devil's advocate. Your job is to CHALLENGE every selection.
 
-    async with httpx.AsyncClient(timeout=10) as http:
-        try:
-            resp = await http.get(
-                "https://api.openweathermap.org/data/2.5/weather",
-                params={
-                    "q": venue_city,
-                    "appid": os.environ.get("OPENWEATHER_KEY", ""),
-                    "units": "metric",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            weather = {
-                "temp_c": data["main"]["temp"],
-                "wind_kmh": round(data["wind"]["speed"] * 3.6, 1),
-                "rain_probability": data.get("rain", {}).get("1h", 0),
-                "conditions": data["weather"][0]["description"],
-            }
-            logger.info(
-                f"[SCOUT] Weather for {venue_city}: {weather['conditions']}, "
-                f"{weather['temp_c']}°C, wind {weather['wind_kmh']} km/h"
-            )
-            return weather
-        except Exception as e:
-            logger.warning(f"[SCOUT] Weather fetch failed for {venue_city}: {e}")
-            return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
+For each selection, ask:
+1. What is the most likely way this loses?
+2. What assumptions are we making that could be wrong?
+3. What piece of news from the last 48 hours could break this?
+4. Is the market already pricing in what we think is an edge?
+5. Historical base rate: how often does this market win at these odds?
+
+Be genuinely critical. If you find a serious flaw, flag it.
+Adjust the confidence DOWN where warranted.
+
+Output JSON: {"adjusted_selections": [...], "overall_confidence_adjustment": float, "critical_flags": [...], "auditor_verdict": "APPROVE|REVISE|REJECT"}""" + JSON_RULES
+
+DECISION_PROMPT = """You are the DECISION AGENT for Football Pulse AI.
+You receive the final audited ticket and make the publish/no-bet call.
+
+Note: combined_odds has already been computed deterministically from real
+bookmaker odds — you do not need to recalculate it, only check it falls in range.
+
+PUBLISH IF:
+- Overall confidence >= 0.70 (70%)
+- Combined odds within 8.0-13.0
+- At least 2 selections passed auditor review
+- No HARD REJECT flags active
+- Auditor verdict is APPROVE or REVISE (with acceptable adjustments)
+
+NO BET IF:
+- Any condition above fails
+- Gut-check: does this ticket look like disciplined value or desperate volume?
+
+Output JSON: {"decision": "PUBLISH|NO_BET", "reason": str, "final_confidence": float}""" + JSON_RULES
+
+PUBLISHER_PROMPT = """You are the PUBLISHER AGENT for Football Pulse AI.
+Format the final ticket for human-readable release as PLAIN TEXT (not JSON).
+
+Each selection in the portfolio has these fields: home_team, away_team, league,
+market, odds (real decimal odds, already validated), rationale.
+
+Output in exactly this format — no additions, no removals:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔵 FOOTBALL PULSE AI
+📅 {date}  |  🕗 08:00 EAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Confidence: {confidence}%
+⚠️  Overall Risk: {risk_level}
+
+For each selection, include a block like:
+MATCH: {home_team} vs {away_team} ({league})
+Market: {market}
+Odds: {odds}
+Reason: {short reason based on rationale}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 Combined Odds: {combined_odds}
+💡 Expected Risk: {risk_level}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  DISCLAIMER
+This is a probabilistic model output.
+No prediction is guaranteed.
+Bet only what you can afford to lose.
+Discipline over volume. Always.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use the EXACT odds and combined_odds values provided — do not recalculate or
+invent numbers. Respond with ONLY the formatted ticket text. No commentary
+before or after."""
 
 
 def _extract_json(text: str) -> dict:
@@ -513,211 +211,338 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
-def analyze_with_groq(raw_data: dict) -> dict:
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        max_tokens=2048,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"""Analyze this raw fixture data and return structured match intelligence JSON.
+def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
+    try:
+        home = odds_snapshot.get("home_win")
+        draw = odds_snapshot.get("draw")
+        away = odds_snapshot.get("away_win")
 
-RAW DATA:
-{raw_data}
+        if market == "home_win":
+            return _valid(home)
+        if market == "away_win":
+            return _valid(away)
+        if market == "draw":
+            return _valid(draw)
+        if market == "btts_yes":
+            return _valid(odds_snapshot.get("btts_yes"))
+        if market == "over25":
+            return _valid(odds_snapshot.get("over25"))
+        if market == "double_chance_home" and home and draw:
+            implied = (1 / home) + (1 / draw)
+            return _valid(round(1 / implied, 3)) if implied > 0 else None
+        if market == "double_chance_away" and away and draw:
+            implied = (1 / away) + (1 / draw)
+            return _valid(round(1 / implied, 3)) if implied > 0 else None
+        if market == "draw_no_bet_home" and home and draw:
+            p_home = 1 / home
+            p_draw = 1 / draw
+            p_away = 1 / away if away else max(0.01, 1 - p_home - p_draw)
+            adj_p_home = p_home / (p_home + p_away) if (p_home + p_away) > 0 else None
+            return _valid(round(1 / adj_p_home, 3)) if adj_p_home else None
+        if market == "draw_no_bet_away" and away and draw:
+            p_home = 1 / home if home else 0
+            p_draw = 1 / draw
+            p_away = 1 / away
+            adj_p_away = p_away / (p_home + p_away) if (p_home + p_away) > 0 else None
+            return _valid(round(1 / adj_p_away, 3)) if adj_p_away else None
+        return None
+    except (TypeError, ZeroDivisionError):
+        return None
 
-Return a JSON object with this structure (and nothing else):
+
+def _valid(odds: float | None) -> float | None:
+    if odds is None:
+        return None
+    try:
+        odds = float(odds)
+    except (TypeError, ValueError):
+        return None
+    if odds < 1.01:
+        return None
+    return odds
+
+
+def run_analyst(clean_matches: list[dict]) -> list[dict]:
+    probabilities = []
+    for i, match in enumerate(clean_matches):
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=1500,
+            messages=[
+                {"role": "system", "content": ANALYST_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"""Estimate probabilities for this match:
+{json.dumps(match, indent=2)}
+
+Return JSON:
 {{
   "fixture_id": int,
   "home_team": str,
   "away_team": str,
-  "league": str,
-  "kickoff_utc": str,
-  "form": {{"home": [...], "away": [...]}},
-  "injuries": {{"home": [...], "away": [...]}},
-  "odds_snapshot": {{"home_win": float, "draw": float, "away_win": float, "btts_yes": float, "over25": float}},
-  "odds_movement": str,
-  "lineup_status": {{"home_confirmed": bool, "away_confirmed": bool}},
-  "weather_risk": {{"level": "low|medium|high", "reason": str}},
-  "travel_km": int,
-  "scout_flags": [str],
-  "data_completeness": float
-}}""",
-            }
-        ],
-    )
-    text = response.choices[0].message.content
-    result = _extract_json(text)
-
-    # Guard: if the model returned a list instead of a dict, unwrap it
-    if isinstance(result, list):
-        logger.warning("[SCOUT] LLM returned a list instead of a dict — unwrapping first element.")
-        result = result[0] if result and isinstance(result[0], dict) else {}
-
-    if not isinstance(result, dict):
-        logger.error(f"[SCOUT] Failed to parse LLM response as JSON object: {text[:200]}")
-        return {}
-
-    return result
-
-
-MIN_QUALIFYING_MATCHES = 2
-QUALIFYING_COMPLETENESS = CLEANER_THRESHOLD_ENV
-HARD_CAP_MATCHES = 18
-
-
-async def _deep_analyze(fixture: dict, odds_event: dict, epl_injuries: dict) -> dict:
-    fixture_id = fixture["id"]
-    home_name = fixture["homeTeam"]["name"]
-    away_name = fixture["awayTeam"]["name"]
-    competition_code = fixture.get("_competition_code")
-
-    # Try to get venue city from the API response first,
-    # then fall back to our home-team lookup table.
-    venue_city = (
-        fixture.get("venue")
-        or fixture.get("homeTeam", {}).get("venue")
-        or _get_venue_city(home_name)
-    )
-    if venue_city:
-        logger.info(f"[SCOUT] Venue city for {home_name}: {venue_city}")
-    else:
-        logger.info(f"[SCOUT] No venue city found for {home_name} — skipping weather.")
-
-    odds_snapshot = _extract_odds_snapshot(odds_event) if odds_event else {}
-
-    home_injuries = []
-    away_injuries = []
-    if competition_code == "PL":
-        home_injuries = _lookup_epl_injuries(epl_injuries, home_name)
-        away_injuries = _lookup_epl_injuries(epl_injuries, away_name)
-
-    weather = await fetch_weather(venue_city)
-
-    raw = {
-        "fixture": fixture,
-        "odds": odds_snapshot,
-        "home_injuries": home_injuries,
-        "away_injuries": away_injuries,
-        "weather": weather,
-        "venue_city": venue_city,
-    }
-
-    structured = analyze_with_groq(raw)
-
-    # If LLM returned nothing usable, build a minimal skeleton so we don't crash
-    if not structured:
-        logger.warning(f"[SCOUT] analyze_with_groq returned empty result for {home_name} vs {away_name} — using skeleton.")
-        structured = {
-            "fixture_id": fixture_id,
-            "home_team": home_name,
-            "away_team": away_name,
-            "league": fixture.get("competition", {}).get("name", "Unknown"),
-            "data_completeness": 0.2,
-        }
-
-    if "data_completeness" not in structured or structured.get("data_completeness") is None:
-        score = 0.0
-        if structured.get("home_team") and structured.get("away_team"):
-            score += 0.4
-        if home_injuries or away_injuries:
-            score += 0.3
-        if odds_snapshot:
-            score += 0.2
-        if weather.get("temp_c") is not None:
-            score += 0.1
-        structured["data_completeness"] = round(score, 2)
-
-    structured.setdefault("fixture_id", fixture_id)
-    if not structured.get("odds_snapshot") and odds_snapshot:
-        structured["odds_snapshot"] = odds_snapshot
-
-    logger.info(
-        f"[SCOUT] ✓ {structured.get('home_team', '?')} vs {structured.get('away_team', '?')} "
-        f"({structured.get('league', '?')}) — completeness={structured.get('data_completeness')}"
-    )
-    return structured
-
-
-async def run(target_date: date | None = None) -> list[dict]:
-    """
-    Main scout agent entrypoint.
-    Model: openai/gpt-oss-20b (20,000 TPM free tier).
-    Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
-    """
-    target_date = target_date or date.today()
-    league_names = list(TOP_LEAGUE_IDS.values())
-    logger.info(f"[SCOUT] Collecting intelligence for {target_date} (leagues: {league_names})")
-
-    fixtures = await fetch_fixtures(target_date)
-    if not fixtures:
-        logger.warning("[SCOUT] No fixtures found in configured leagues for this date.")
-        return []
-
-    codes_present = {f["_competition_code"] for f in fixtures}
-
-    logger.info(f"[SCOUT] Fetching odds for {len(codes_present)} competition(s) with fixtures today...")
-    odds_by_league: dict[str, list[dict]] = {}
-    for code in codes_present:
-        sport_key = ODDS_SPORT_KEYS.get(code)
-        if not sport_key:
-            logger.info(f"[SCOUT] No odds source configured for competition {code} — skipping.")
-            continue
-        odds_by_league[code] = await fetch_league_odds(sport_key)
-        await asyncio.sleep(0.5)
-
-    epl_injuries: dict[str, list[dict]] = {}
-    if "PL" in codes_present:
-        epl_injuries = await fetch_epl_injuries()
-
-    scanned = []
-    for fixture in fixtures:
-        events = odds_by_league.get(fixture["_competition_code"], [])
-        matched = _find_match_odds(events, fixture["homeTeam"]["name"], fixture["awayTeam"]["name"])
-        scanned.append((fixture, matched))
-
-    with_odds = [(f, o) for f, o in scanned if o]
-    without_odds = [(f, o) for f, o in scanned if not o]
-    prioritized = with_odds + without_odds
-
-    logger.info(f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds. Prioritizing those first.")
-
-    results: list[dict] = []
-    cursor = 0
-    is_first_batch = True
-
-    while cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
-        batch_size = MAX_MATCHES_PER_DAY if is_first_batch else FALLBACK_BATCH_SIZE
-        remaining_budget = HARD_CAP_MATCHES - len(results)
-        batch_size = min(batch_size, remaining_budget)
-
-        batch = prioritized[cursor:cursor + batch_size]
-        cursor += batch_size
-        is_first_batch = False
-
-        logger.info(f"[SCOUT] Analyzing batch of {len(batch)} fixture(s) (processed so far: {len(results)})...")
-
-        for fixture, odds_event in batch:
-            structured = await _deep_analyze(fixture, odds_event, epl_injuries)
-            results.append(structured)
-            await asyncio.sleep(GROQ_CALL_DELAY_SECONDS)
-
-        qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
-        logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
-
-        if qualifying >= MIN_QUALIFYING_MATCHES:
-            logger.info("[SCOUT] Enough qualifying matches found — stopping further batches.")
-            break
-
-        if cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
+  "markets": {{
+    "home_win": float,
+    "draw": float,
+    "away_win": float,
+    "btts_yes": float,
+    "over15": float,
+    "over25": float,
+    "under45": float,
+    "double_chance_home": float,
+    "double_chance_away": float,
+    "draw_no_bet_home": float,
+    "draw_no_bet_away": float
+  }},
+  "key_factors": [str],
+  "model_confidence": float
+}}"""
+                }
+            ]
+        )
+        text = response.choices[0].message.content
+        data = _extract_json(text)
+        if data:
+            data.setdefault("fixture_id", match.get("fixture_id"))
+            data.setdefault("home_team", match.get("home_team"))
+            data.setdefault("away_team", match.get("away_team"))
+            data["odds_snapshot"] = match.get("odds_snapshot", {})
+            data["league"] = match.get("league")
+            probabilities.append(data)
             logger.info(
-                f"[SCOUT] Only {qualifying} qualifying match(es) so far (need {MIN_QUALIFYING_MATCHES}). "
-                f"Pulling one fallback batch automatically..."
+                f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
+                f"— model_confidence={data.get('model_confidence')}"
+            )
+        else:
+            logger.error(f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')}: {text[:200]}")
+        if i < len(clean_matches) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
+    return probabilities
+
+
+def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list[dict]:
+    safe = []
+    for i, prob in enumerate(probabilities):
+        intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=600,
+            messages=[
+                {"role": "system", "content": RISK_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Evaluate risk:\nProbabilities: {json.dumps(prob)}\nIntelligence: {json.dumps(intel)}"
+                }
+            ]
+        )
+        text = response.choices[0].message.content
+        risk_data = _extract_json(text)
+        if not risk_data:
+            logger.error(f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')}: {text[:200]}")
+        elif risk_data.get("approved"):
+            prob["risk_assessment"] = risk_data
+            safe.append(prob)
+            logger.info(
+                f"[RISK] Approved: {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"— risk={risk_data.get('risk_level')}"
             )
         else:
             logger.info(
-                f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget remaining."
+                f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
+                f"— model_confidence={prob.get('model_confidence')} "
+                f"— {risk_data.get('rejection_reason')}"
+            )
+        if i < len(probabilities) - 1:
+            time.sleep(GROQ_CALL_DELAY_SECONDS)
+    return safe
+
+
+def run_portfolio(safe_matches: list[dict]) -> dict:
+    if len(safe_matches) < 2:
+        return {"decision": "NO_BET", "reason": "Insufficient safe candidates after risk filtering."}
+
+    match_lookup = {m.get("fixture_id"): m for m in safe_matches}
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=1500,
+        messages=[
+            {"role": "system", "content": PORTFOLIO_PROMPT},
+            {
+                "role": "user",
+                "content": f"Select matches and markets from these safe candidates:\n{json.dumps(safe_matches, indent=2)}"
+            }
+        ]
+    )
+    text = response.choices[0].message.content
+    data = _extract_json(text)
+    if not data:
+        logger.error(f"Portfolio parse error: {text[:200]}")
+        return {"decision": "NO_BET", "reason": "Portfolio construction failed."}
+
+    if data.get("decision") == "NO_BET":
+        return data
+
+    raw_selections = data.get("selections", [])
+    if len(raw_selections) < 2:
+        return {"decision": "NO_BET", "reason": "Portfolio agent selected fewer than 2 matches."}
+
+    final_selections = []
+    skipped = []
+
+    for sel in raw_selections:
+        fixture_id = sel.get("fixture_id")
+        market = sel.get("market")
+        match = match_lookup.get(fixture_id)
+        if not match:
+            skipped.append(f"fixture {fixture_id} not found in safe matches")
+            continue
+        odds_snapshot = match.get("odds_snapshot", {}) or {}
+        odds = _derive_odds(market, odds_snapshot)
+        if odds is None:
+            skipped.append(
+                f"{match.get('home_team')} vs {match.get('away_team')} "
+                f"({market}): could not derive valid odds from available data"
+            )
+            continue
+        final_selections.append({
+            "fixture_id": fixture_id,
+            "home_team": match.get("home_team"),
+            "away_team": match.get("away_team"),
+            "league": match.get("league"),
+            "market": market,
+            "odds": odds,
+            "rationale": sel.get("rationale", ""),
+        })
+
+    if skipped:
+        logger.info(f"[PORTFOLIO] Skipped selections: {skipped}")
+
+    if len(final_selections) < 2:
+        return {"decision": "NO_BET", "reason": f"Fewer than 2 selections had derivable odds. Skipped: {skipped}"}
+
+    final_selections = final_selections[:5]
+    combined_odds = 1.0
+    for s in final_selections:
+        combined_odds *= s["odds"]
+
+    return {
+        "selections": final_selections,
+        "combined_odds": round(combined_odds, 2),
+        "portfolio_confidence": data.get("portfolio_confidence"),
+        "rationale": data.get("rationale", ""),
+        "risk_level": data.get("risk_level", "Medium"),
+    }
+
+
+def run_auditor(portfolio: dict) -> dict:
+    if portfolio.get("decision") == "NO_BET":
+        return {"auditor_verdict": "REJECT", "critical_flags": ["No portfolio to audit — already NO_BET."]}
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=1500,
+        messages=[
+            {"role": "system", "content": AUDITOR_PROMPT},
+            {
+                "role": "user",
+                "content": f"Challenge this ticket:\n{json.dumps(portfolio, indent=2)}"
+            }
+        ]
+    )
+    text = response.choices[0].message.content
+    data = _extract_json(text)
+    if not data:
+        logger.error(f"Auditor parse error: {text[:200]}")
+        return {"auditor_verdict": "REJECT", "critical_flags": ["Auditor system error — could not parse response."]}
+    return data
+
+
+def run_decision(audited: dict, portfolio: dict) -> dict:
+    if portfolio.get("decision") == "NO_BET":
+        return {"decision": "NO_BET", "reason": portfolio.get("reason", "No valid portfolio constructed."), "final_confidence": 0.0}
+
+    if audited.get("auditor_verdict") == "REJECT":
+        return {"decision": "NO_BET", "reason": f"Auditor rejected: {audited.get('critical_flags')}", "final_confidence": 0.0}
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=400,
+        messages=[
+            {"role": "system", "content": DECISION_PROMPT},
+            {
+                "role": "user",
+                "content": f"Portfolio: {json.dumps(portfolio)}\nAudit: {json.dumps(audited)}\nMake the final decision."
+            }
+        ]
+    )
+    text = response.choices[0].message.content
+    data = _extract_json(text)
+    if not data:
+        logger.error(f"Decision parse error: {text[:200]}")
+        return {"decision": "NO_BET", "reason": "Decision agent error — defaulting safe.", "final_confidence": 0.0}
+
+    final_confidence = data.get("final_confidence")
+    combined_odds = portfolio.get("combined_odds")
+
+    if final_confidence is not None and final_confidence < 0.70:
+        if data.get("decision") == "PUBLISH":
+            logger.warning(
+                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
+                f"final_confidence={final_confidence} < 0.70"
+            )
+        data["decision"] = "NO_BET"
+        if "below" not in str(data.get("reason", "")).lower():
+            data["reason"] = (
+                f"Overridden to NO_BET: final_confidence "
+                f"({final_confidence}) is below the 0.70 publish threshold. "
+                f"Original reasoning: {data.get('reason', '')}"
             )
 
-    logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages total.")
-    return results
+    if combined_odds is not None and not (8.0 <= combined_odds <= 13.0):
+        if data.get("decision") == "PUBLISH":
+            logger.warning(
+                f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
+                f"combined_odds={combined_odds} outside 8.0-13.0 range"
+            )
+        data["decision"] = "NO_BET"
+        data["reason"] = (
+            f"Overridden to NO_BET: combined_odds ({combined_odds}) is outside "
+            f"the required 8.0-13.0 range. Original reasoning: {data.get('reason', '')}"
+        )
+
+    return data
+
+
+def run_publisher(portfolio: dict, decision: dict, audited: dict, target_date: str) -> str:
+    if decision.get("decision") == "NO_BET":
+        return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔵 FOOTBALL PULSE AI
+📅 {target_date}  |  🕗 08:00 EAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚫 NO BET TODAY
+
+Reason: {decision.get('reason', 'Insufficient edge detected.')}
+
+The system found no selections meeting
+the 70%+ confidence threshold today.
+
+Discipline over volume. We wait.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        max_tokens=1200,
+        messages=[
+            {"role": "system", "content": PUBLISHER_PROMPT},
+            {
+                "role": "user",
+                "content": f"""Format the final ticket.
+Date: {target_date}
+Portfolio: {json.dumps(portfolio)}
+Decision: {json.dumps(decision)}
+Audited: {json.dumps(audited)}"""
+            }
+        ]
+    )
+    return response.choices[0].message.content
