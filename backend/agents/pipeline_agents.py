@@ -49,18 +49,34 @@ _current_model_index = 0
 #
 # All three models in this chain support reasoning_effort (confirmed at
 # console.groq.com/docs/reasoning and the qwen3.6-27b model card, checked
-# 2026-08-22), but the valid values differ by family:
-#   - gpt-oss (20b/120b): "low" | "medium" | "high" — reasoning is always on
-#     to some degree and can't be fully disabled, so "low" is the floor.
-#   - qwen3.6-27b: "none" | "default" — "none" is genuine non-thinking mode
-#     per Groq's own model card ("use non-thinking mode (reasoning_effort=
-#     'none') for efficient, general-purpose dialogue").
+# 2026-08-22), but the valid values — and what they actually MEAN — differ
+# by family in a way that matters a lot for a token-budgeted pipeline:
+#   - gpt-oss (20b/120b): "low" | "medium" | "high" — three genuinely
+#     bounded steps on the same scale. Reasoning is always on to some
+#     degree and can't be fully disabled, so "low" is the floor, but "medium"
+#     is a modest, predictable bump from "low", not a different mode.
+#   - qwen3.6-27b: "none" | "default" — NOT bounded steps on a scale. Per
+#     Groq's own model card, "default" is literally "thinking mode... for
+#     complex reasoning, math, and coding" — genuinely open-ended
+#     chain-of-thought with no built-in ceiling, as opposed to "none"
+#     ("non-thinking mode... for efficient, general-purpose dialogue").
+#     This is a real, observed failure mode on this model family: reports
+#     of default/unbounded thinking mode burning 20,000+ reasoning tokens
+#     on trivial requests are common. In this pipeline it showed up as
+#     Portfolio hitting finish_reason="length" with completely EMPTY
+#     content at both max_tokens=4000 and, after the truncation retry,
+#     6000 — the model was spending the entire budget on invisible
+#     reasoning before writing a single character of JSON, so raising
+#     max_tokens further doesn't help; there's no ceiling to reach.
 #
 # Every task in this file (Analyst/Risk/Portfolio/Auditor/Decision/Publisher)
-# is a bounded structured-output task, not open-ended problem solving, so
-# minimal reasoning is the right default everywhere. Portfolio is the one
-# call that benefits from a bit more room to weigh combinations, so it opts
-# into "default" via the reasoning_effort argument to _groq_chat.
+# is a bounded structured-output task, not open-ended problem solving. For
+# gpt-oss, Portfolio still opts into the bounded "medium" step for a bit more
+# room to weigh combinations (see reasoning_effort="default" on that call).
+# For qwen specifically, "default" is NOT used anywhere in this file, even
+# for Portfolio — its two-mode "none"/"default" split doesn't have a safe
+# middle ground the way gpt-oss's three-step scale does, so every call maps
+# to "none" on qwen regardless of which desired level the caller asked for.
 #
 # reasoning_format="hidden" is set unconditionally alongside reasoning_effort
 # (per the qwen model card's own recommendation: "set reasoning_format to
@@ -69,7 +85,7 @@ _current_model_index = 0
 # don't leak into `content` and break JSON parsing.
 _REASONING_EFFORT_BY_FAMILY: dict[str, dict[str, str]] = {
     "gpt-oss": {"minimal": "low", "default": "medium"},
-    "qwen": {"minimal": "none", "default": "default"},
+    "qwen": {"minimal": "none", "default": "none"},
 }
 
 
@@ -642,7 +658,10 @@ def _groq_chat(
     qwen — see _REASONING_EFFORT_BY_FAMILY) because every task in this file
     is bounded structured-output generation, not open-ended problem solving.
     Pass "default" for a call that genuinely benefits from more reasoning
-    room (currently just Portfolio's combination search).
+    room (currently just Portfolio's combination search) — note this only
+    changes gpt-oss's behavior (to its bounded "medium" step); qwen maps
+    "default" to "none" too, since qwen's "default" is unbounded thinking
+    mode, not a bounded step (see _REASONING_EFFORT_BY_FAMILY for why).
 
     Also guards against reasoning models running out of max_tokens before
     finishing their answer — signaled by finish_reason="length" — which can
@@ -974,16 +993,23 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     # This is the most reasoning-heavy call in the pipeline — it has to weigh
     # combinations across every safe candidate to hit an 8.0-13.0 combined-odds
     # target, so unlike every other call in this file it opts into "default"
-    # reasoning effort rather than "minimal" (maps to gpt-oss "medium" / qwen
-    # "default" — see _REASONING_EFFORT_BY_FAMILY).
+    # reasoning effort rather than "minimal" (maps to gpt-oss "medium" — a
+    # bounded step. On qwen it now maps to "none", same as "minimal", because
+    # qwen's "default" is unbounded thinking mode, not a bounded step — see
+    # the _REASONING_EFFORT_BY_FAMILY comment for the full explanation and
+    # the production failure this caused: finish_reason="length" with
+    # completely EMPTY content at both max_tokens=4000 and 6000, because the
+    # model was spending the whole budget on invisible reasoning with no
+    # ceiling to hit).
     #
     # NOTE ON max_tokens=4000 (was 3000): the last run hit finish_reason=
     # "length" with EMPTY content at 3000 (whole budget spent before any
-    # visible output), forcing a retry at 6000. 4000 gives "default"
-    # reasoning effort more breathing room to actually reach visible output
-    # on the first attempt for the common case (2-5 selections), while the
-    # existing truncation retry still climbs to the 6000 ceiling if a
-    # particular candidate set needs it.
+    # visible output), forcing a retry at 6000. 4000 gives gpt-oss's
+    # "medium" reasoning effort more breathing room to actually reach
+    # visible output on the first attempt for the common case (2-5
+    # selections), while the existing truncation retry still climbs to the
+    # 6000 ceiling if a particular candidate set needs it. (This budget is
+    # irrelevant for qwen now that it runs in "none"/non-thinking mode.)
     text = _groq_chat(
         max_tokens=4000,
         reasoning_effort="default",
