@@ -25,6 +25,38 @@ GROQ_TPM_WINDOW_SECONDS = 60
 GROQ_MAX_LOCAL_RETRIES = 4
 _token_usage_log: list[tuple[float, int]] = []
 
+# Model fallback chain: on a daily-quota 429 (RPD/TPD) we switch to the next
+# model rather than sleeping out a multi-minute daily cooldown, since each
+# model on Groq carries its own independent daily budget. See GROQ_MODEL
+# below for the primary model — this chain must start with it.
+GROQ_MODEL_FALLBACK_CHAIN = [
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+]
+_current_model_index = 0
+
+
+def _current_model() -> str:
+    return GROQ_MODEL_FALLBACK_CHAIN[_current_model_index]
+
+
+def _switch_to_next_model() -> bool:
+    global _current_model_index
+    if _current_model_index >= len(GROQ_MODEL_FALLBACK_CHAIN) - 1:
+        return False
+    _current_model_index += 1
+    _token_usage_log.clear()
+    logger.warning(
+        f"[FALLBACK] Daily quota hit on previous model — switching to {_current_model()}"
+    )
+    return True
+
+
+def _is_daily_limit_error(err: RateLimitError) -> bool:
+    msg = str(err).lower()
+    return "per day" in msg or "tpd" in msg or "rpd" in msg
+
 
 def _tokens_used_in_window(now: float) -> int:
     cutoff = now - GROQ_TPM_WINDOW_SECONDS
@@ -57,8 +89,9 @@ def _retry_after_seconds(err: RateLimitError) -> float | None:
 
 def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
     """Same rate-limit-aware choke point as backend/agents/pipeline_agents.py —
-    paces calls against real rolling TPM usage instead of a flat sleep, and
-    honors the server's Retry-After header if a 429 still slips through."""
+    paces calls against real rolling TPM usage, falls forward to the next
+    model in the chain on a daily-quota 429, and otherwise honors the
+    server's Retry-After header if a per-minute 429 still slips through."""
     prompt_chars = sum(len(m.get("content", "")) for m in messages)
     estimated_tokens = (prompt_chars // 4) + max_tokens
 
@@ -66,15 +99,17 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
         _pace_before_call(estimated_tokens)
         try:
             response = client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=_current_model(),
                 max_tokens=max_tokens,
                 messages=messages,
             )
         except RateLimitError as e:
+            if _is_daily_limit_error(e) and _switch_to_next_model():
+                continue
             wait = _retry_after_seconds(e) or (2 ** attempt) * 5
             logger.warning(
-                f"[RATE LIMIT] Groq 429 (attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) "
-                f"— sleeping {wait:.1f}s"
+                f"[RATE LIMIT] Groq 429 on {_current_model()} "
+                f"(attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
             )
             time.sleep(wait)
             continue
@@ -85,7 +120,9 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
         return response.choices[0].message.content
 
     raise RuntimeError(
-        f"Groq API: still rate-limited after {GROQ_MAX_LOCAL_RETRIES} local retries"
+        f"Groq API: still rate-limited on {_current_model()} after "
+        f"{GROQ_MAX_LOCAL_RETRIES} local retries (fallback chain exhausted: "
+        f"{_current_model_index == len(GROQ_MODEL_FALLBACK_CHAIN) - 1})"
     )
 
 DEFAULT_LEAGUE_IDS = {
@@ -334,10 +371,6 @@ def _get_venue_city(home_team_name: str) -> str | None:
         if key in name_lower or name_lower in key:
             return city
     return None
-
-
-# Model in use — openai/gpt-oss-20b has 20,000 TPM on the free tier.
-GROQ_MODEL = "openai/gpt-oss-20b"
 
 
 def _load_league_ids() -> dict[str, str]:
