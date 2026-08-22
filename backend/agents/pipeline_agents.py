@@ -82,11 +82,14 @@ GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", 18000))
 GROQ_TPM_WINDOW_SECONDS = 60
 GROQ_MAX_LOCAL_RETRIES = 4
 
-# Ceiling for the empty-content-due-to-truncated-reasoning retry in
-# _groq_chat. gpt-oss models can spend an entire max_tokens budget on hidden
-# chain-of-thought and return finish_reason="length" with empty content —
-# this caps how far we'll bump max_tokens chasing that before giving up.
-GROQ_EMPTY_CONTENT_RETRY_CEILING = 4000
+# Ceiling for the truncation retry in _groq_chat. gpt-oss models can run out
+# of max_tokens two different ways: (1) spend the entire budget on hidden
+# chain-of-thought and return empty content, or (2) spend it mid-answer and
+# return a cut-off, non-empty-but-invalid partial response (e.g. an
+# unterminated JSON string). Both show up as finish_reason="length" — content
+# emptiness is not a reliable signal on its own, so the retry keys off
+# finish_reason alone. This caps how far we'll bump max_tokens chasing it.
+GROQ_TRUNCATION_RETRY_CEILING = 6000
 
 _token_usage_log: list[tuple[float, int]] = []
 
@@ -332,13 +335,14 @@ def _groq_chat(
     on a daily-quota 429, and otherwise backs off using the server's
     Retry-After header instead of failing the whole pipeline run.
 
-    Also guards against gpt-oss models spending their entire max_tokens
-    budget on hidden chain-of-thought and returning empty content with
-    finish_reason="length" — a real 200 OK that looks like a parse error
-    downstream. When that happens we bump max_tokens once (up to
-    GROQ_EMPTY_CONTENT_RETRY_CEILING) and retry the same call before
-    giving up, since the model did produce something, it just didn't
-    have room left to write the answer down.
+    Also guards against gpt-oss models running out of max_tokens before
+    finishing their answer — signaled by finish_reason="length" — which can
+    surface as either empty content (whole budget spent on hidden
+    chain-of-thought) or non-empty-but-truncated content (e.g. a JSON object
+    cut off mid-string). Both are real 200 OK responses that look like parse
+    errors downstream, so we key off finish_reason itself rather than
+    content emptiness, and bump max_tokens (up to GROQ_TRUNCATION_RETRY_CEILING)
+    and retry the same call before giving up.
     """
     global _last_finish_reason
     prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -388,12 +392,17 @@ def _groq_chat(
         finish_reason = getattr(response.choices[0], "finish_reason", None)
         _last_finish_reason = finish_reason
 
-        if not content and finish_reason == "length" and max_tokens < GROQ_EMPTY_CONTENT_RETRY_CEILING:
-            bumped = min(max_tokens * 2, GROQ_EMPTY_CONTENT_RETRY_CEILING)
+        # Key off finish_reason alone, not content emptiness — a truncated
+        # call can come back with SOME content (a cut-off JSON string) just
+        # as easily as none (whole budget spent on hidden reasoning), and
+        # both are equally unusable to the caller.
+        if finish_reason == "length" and max_tokens < GROQ_TRUNCATION_RETRY_CEILING:
+            bumped = min(max_tokens * 2, GROQ_TRUNCATION_RETRY_CEILING)
+            preview = (content or "")[:80]
             logger.warning(
-                f"[EMPTY CONTENT] {_current_model()} exhausted {max_tokens} tokens "
-                f"on hidden reasoning with no visible output (finish_reason=length) — "
-                f"retrying with max_tokens={bumped}"
+                f"[TRUNCATED] {_current_model()} hit its {max_tokens}-token limit "
+                f"before finishing (finish_reason=length, content={'empty' if not content else f'partial: {preview!r}'}) "
+                f"— retrying with max_tokens={bumped}"
             )
             max_tokens = bumped
             continue
@@ -581,8 +590,9 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
             f"content_len={len(text)}): {text[:200]}"
         )
         reason = (
-            "Portfolio construction failed: model exhausted its token budget on "
-            "hidden reasoning with no output (finish_reason=length)."
+            "Portfolio construction failed: model output was cut off before "
+            "completing valid JSON, even after a retry with more tokens "
+            "(finish_reason=length)."
             if _last_finish_reason == "length"
             else "Portfolio construction failed: model returned unparseable content."
         )
