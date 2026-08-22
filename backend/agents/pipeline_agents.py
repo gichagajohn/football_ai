@@ -16,8 +16,44 @@ logger = logging.getLogger(__name__)
 # don't stack (SDK backoff + our backoff was making failures take even longer).
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
 
-# Model: openai/gpt-oss-20b — 20,000 TPM free tier
-GROQ_MODEL = "openai/gpt-oss-20b"
+# Model fallback chain: if the *active* model hits its daily quota (RPD/TPD —
+# not the per-minute TPM window our pacer already handles), we switch to the
+# next model instead of sleeping out a multi-minute daily cooldown. Each
+# model on Groq has its own independent daily budget, so this unblocks the
+# run immediately. Ordered by preference; only falls forward, never back.
+GROQ_MODEL_FALLBACK_CHAIN = [
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+]
+_current_model_index = 0
+
+
+def _current_model() -> str:
+    return GROQ_MODEL_FALLBACK_CHAIN[_current_model_index]
+
+
+def _switch_to_next_model() -> bool:
+    """Advance to the next fallback model. Returns False if none remain."""
+    global _current_model_index
+    if _current_model_index >= len(GROQ_MODEL_FALLBACK_CHAIN) - 1:
+        return False
+    _current_model_index += 1
+    _token_usage_log.clear()  # fresh model = fresh TPM budget, don't carry over pacing state
+    logger.warning(
+        f"[FALLBACK] Daily quota hit on previous model — switching to {_current_model()}"
+    )
+    return True
+
+
+def _is_daily_limit_error(err: RateLimitError) -> bool:
+    """Groq's error body says e.g. '...on tokens per day (TPD): Limit...' —
+    that's a quota that won't refill for hours, unlike a per-minute TPM/RPM
+    limit which our pacer already avoids. Sleeping it out isn't worth it when
+    a fallback model with its own separate daily budget is available."""
+    msg = str(err).lower()
+    return "per day" in msg or "tpd" in msg or "rpd" in msg
+
 
 # A flat inter-call delay isn't enough to stay under the account's TPM budget
 # because prompt size (and therefore token cost) varies a lot per match —
@@ -264,9 +300,9 @@ def _retry_after_seconds(err: RateLimitError) -> float | None:
 
 def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
     """Single choke point for every Groq call: paces requests against the
-    account's real TPM budget, and if a 429 still slips through, backs off
-    using the server's Retry-After header (falling back to exponential
-    backoff) instead of failing the whole pipeline run."""
+    active model's TPM budget, falls forward to the next model in the chain
+    on a daily-quota 429, and otherwise backs off using the server's
+    Retry-After header instead of failing the whole pipeline run."""
     prompt_chars = sum(len(m.get("content", "")) for m in messages)
     estimated_tokens = (prompt_chars // 4) + max_tokens
 
@@ -274,15 +310,17 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
         _pace_before_call(estimated_tokens)
         try:
             response = client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=_current_model(),
                 max_tokens=max_tokens,
                 messages=messages,
             )
         except RateLimitError as e:
+            if _is_daily_limit_error(e) and _switch_to_next_model():
+                continue  # new model, new budget — retry now, no sleep needed
             wait = _retry_after_seconds(e) or (2 ** attempt) * 5
             logger.warning(
-                f"[RATE LIMIT] Groq 429 (attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) "
-                f"— sleeping {wait:.1f}s"
+                f"[RATE LIMIT] Groq 429 on {_current_model()} "
+                f"(attempt {attempt + 1}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
             )
             time.sleep(wait)
             continue
@@ -293,7 +331,9 @@ def _groq_chat(*, max_tokens: int, messages: list[dict]) -> str:
         return response.choices[0].message.content
 
     raise RuntimeError(
-        f"Groq API: still rate-limited after {GROQ_MAX_LOCAL_RETRIES} local retries"
+        f"Groq API: still rate-limited on {_current_model()} after "
+        f"{GROQ_MAX_LOCAL_RETRIES} local retries (fallback chain exhausted: "
+        f"{_current_model_index == len(GROQ_MODEL_FALLBACK_CHAIN) - 1})"
     )
 
 
