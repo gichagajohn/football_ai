@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Keep the model configurable. The second model is only used when the primary
 # model is unavailable or rate-limited; both are Gemini API model IDs.
-_DEFAULT_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+_DEFAULT_MODELS = ("gemini-3.5-flash-lite", "gemini-3.5-flash")
 _model_names = tuple(
     name.strip()
     for name in os.environ.get("GEMINI_MODELS", "").split(",")
@@ -214,9 +214,17 @@ def gemini_chat(
             )
         except Exception as error:
             code = _error_code(error)
-            if code == 404 and _switch_to_next_model():
-                attempt = 0
-                continue
+            if code == 404:
+                if _switch_to_next_model():
+                    attempt = 0
+                    continue
+                # Do not leak the SDK-specific 404 out to an agent. The
+                # callers already treat RuntimeError as a non-fatal provider
+                # outage and can preserve the rest of the daily run.
+                raise RuntimeError(
+                    f"Gemini API: none of the configured models are available "
+                    f"(last tried: {model}). Set GEMINI_MODELS to valid model IDs."
+                ) from error
             if not _is_retryable(error):
                 raise
 
