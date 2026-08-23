@@ -177,6 +177,18 @@ GROQ_MAX_LOCAL_RETRIES = 4
 # reliable signal on its own, so the retry keys off finish_reason alone.
 GROQ_TRUNCATION_RETRY_CEILING = 6000
 
+# Hard ceiling on any SINGLE sleep this module will ever perform for a 429.
+# See the matching constant/comment in pipeline_agents.py for the full
+# story: a production run hit sleeping 1428.0s (~24 minutes) in a single
+# call on the LAST model in the fallback chain, when it hit a
+# daily-quota-flavored 429 with nowhere left to fall forward to — and got
+# the whole CI job killed mid-sleep as a result, discarding every fixture
+# already analyzed earlier in the same run. Any wait longer than this is
+# treated as "not going to resolve within a time-boxed pipeline run": fall
+# forward to a fresh model if one remains, otherwise give up on this one
+# call via RuntimeError so the caller can skip just this fixture.
+GROQ_MAX_SINGLE_WAIT_SECONDS = float(os.environ.get("GROQ_MAX_SINGLE_WAIT_SECONDS", "90"))
+
 
 # ---------------------------------------------------------------------------
 # Per-model rate limit state, keyed by model name so switching back and
@@ -375,6 +387,28 @@ def _groq_chat(
                 attempt = 0
                 continue  # new model, new budget — retry now, no sleep needed
 
+            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
+
+            # Never block this long inside a time-boxed pipeline run — see
+            # GROQ_MAX_SINGLE_WAIT_SECONDS above. Checked BEFORE the
+            # attempt-count threshold on purpose: the dangerous case is a
+            # huge wait on the very FIRST attempt, which an attempt-count
+            # gate alone never catches (it only falls forward after
+            # GROQ_MAX_LOCAL_RETRIES is already exhausted).
+            if wait > GROQ_MAX_SINGLE_WAIT_SECONDS:
+                logger.warning(
+                    f"[RATE LIMIT] {model} reports a {wait:.0f}s wait — too long "
+                    f"to block on inside this pipeline"
+                )
+                if _switch_to_next_model():
+                    attempt = 0
+                    continue
+                raise RuntimeError(
+                    f"Groq API: {model} reports a {wait:.0f}s rate-limit wait "
+                    f"with no fallback model remaining in the chain — giving "
+                    f"up on this call rather than blocking the whole run."
+                ) from e
+
             attempt += 1
             if attempt >= GROQ_MAX_LOCAL_RETRIES:
                 # Exhausted local retries on this model for a per-minute
@@ -394,7 +428,6 @@ def _groq_chat(
                     f"models remain in the chain."
                 ) from e
 
-            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
             logger.warning(
                 f"[RATE LIMIT] Groq 429 on {model} "
                 f"(attempt {attempt}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
@@ -472,12 +505,7 @@ FPL_NAME_ALIASES = {
     "Wolves": "Wolverhampton Wanderers",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Home city lookup — used when football-data.org doesn't return a venue city.
-# Keys are lowercased team name fragments so partial matches work too.
-# ─────────────────────────────────────────────────────────────────────────────
 TEAM_HOME_CITY: dict[str, str] = {
-    # Premier League
     "arsenal": "London",
     "chelsea": "London",
     "tottenham": "London",
@@ -521,7 +549,6 @@ TEAM_HOME_CITY: dict[str, str] = {
     "middlesbrough": "Middlesbrough",
     "swansea": "Swansea",
     "cardiff": "Cardiff",
-    # La Liga
     "real madrid": "Madrid",
     "atletico madrid": "Madrid",
     "atletico de madrid": "Madrid",
@@ -548,7 +575,6 @@ TEAM_HOME_CITY: dict[str, str] = {
     "girona": "Girona",
     "las palmas": "Las Palmas",
     "leganes": "Leganes",
-    # Bundesliga
     "bayern munich": "Munich",
     "fc bayern": "Munich",
     "borussia dortmund": "Dortmund",
@@ -574,7 +600,6 @@ TEAM_HOME_CITY: dict[str, str] = {
     "cologne": "Cologne",
     "heidenheim": "Heidenheim",
     "darmstadt": "Darmstadt",
-    # Serie A
     "juventus": "Turin",
     "torino": "Turin",
     "ac milan": "Milan",
@@ -599,7 +624,6 @@ TEAM_HOME_CITY: dict[str, str] = {
     "hellas verona": "Verona",
     "venezia": "Venice",
     "parma": "Parma",
-    # Ligue 1
     "psg": "Paris",
     "paris saint-germain": "Paris",
     "paris saint germain": "Paris",
@@ -626,7 +650,6 @@ TEAM_HOME_CITY: dict[str, str] = {
     "metz": "Metz",
     "lorient": "Lorient",
     "saint-etienne": "Saint-Etienne",
-    # Eredivisie
     "ajax": "Amsterdam",
     "psv": "Eindhoven",
     "feyenoord": "Rotterdam",
@@ -635,13 +658,11 @@ TEAM_HOME_CITY: dict[str, str] = {
     "vitesse": "Arnhem",
     "utrecht": "Utrecht",
     "twente": "Enschede",
-    # Primeira Liga
     "benfica": "Lisbon",
     "sporting cp": "Lisbon",
     "porto": "Porto",
     "braga": "Braga",
     "vitoria guimaraes": "Guimaraes",
-    # World Cup / international — use host city where known
     "united states": "New York",
     "usa": "New York",
     "mexico": "Mexico City",
@@ -667,10 +688,6 @@ TEAM_HOME_CITY: dict[str, str] = {
 
 
 def _get_venue_city(home_team_name: str) -> str | None:
-    """
-    Look up a home city for the given team name using the TEAM_HOME_CITY table.
-    Uses case-insensitive substring matching so partial names work too.
-    """
     name_lower = home_team_name.lower().strip()
     if name_lower in TEAM_HOME_CITY:
         return TEAM_HOME_CITY[name_lower]
@@ -750,54 +767,16 @@ IMPORTANT OUTPUT RULES:
 
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Real form / head-to-head / standings data.
-#
-# Previously NOTHING in this file fetched actual recent-form, head-to-head,
-# or standings data — yet SYSTEM_PROMPT told the LLM to ground its analysis
-# in "recent form (last 5 results)" and "head-to-head record", and the
-# requested output schema has a "form" field. With no real data behind it,
-# the model had no choice but to invent plausible-sounding form/H2H for
-# every match, in every league. That's very likely why Analyst confidence
-# clustered so tightly around 0.65 across genuinely different matchups —
-# there was no real signal to differentiate on.
-#
-# These three endpoints (all on football-data.org, using the same
-# FOOTBALL_DATA_KEY already configured) provide the real data:
-#   - /teams/{id}/matches?status=FINISHED&limit=5  -> last-5 results
-#   - /matches/{id}/head2head?limit=10             -> real H2H record
-#   - /competitions/{code}/standings                -> league position/points
-#
-# ENABLE_REAL_FORM_DATA=false skips all three (e.g. if the extra API load
-# is too slow or the free-tier quota is too tight) — in that case the raw
-# data passed to the LLM is explicitly {} for these fields, and
-# SYSTEM_PROMPT instructs it to report "UNKNOWN" rather than invent
-# something, which is strictly more honest than the old behavior either way.
 ENABLE_REAL_FORM_DATA = os.environ.get("ENABLE_REAL_FORM_DATA", "true").strip().lower() != "false"
 
-# football-data.org's free tier is rate-limited (historically ~10 req/min).
-# Fetching form/H2H/standings adds real extra calls on top of fixtures/odds,
-# so we pace them with a simple minimum-interval limiter rather than trusting
-# them not to 429. Raise via env if you're on a paid tier with a higher cap.
 FOOTBALL_DATA_MIN_INTERVAL_SECONDS = _float_env("FOOTBALL_DATA_MIN_INTERVAL_SECONDS", 6.5)
 _fd_last_request_time = 0.0
 
-# How many times to retry a single football-data.org call on a 429 before
-# giving up and returning {} (UNKNOWN) for that one field. The previous
-# version had no retry at all — a single 429 on, say, a team's recent-form
-# call permanently marked that team's form UNKNOWN for the whole match,
-# even though the very next request 30s later succeeded fine (see the
-# fixtures/odds/standings calls right around it in the same run). A couple
-# of bounded retries recovers most of these without risking a long stall.
 FOOTBALL_DATA_MAX_RETRIES = 2
 FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS = 30.0
 
 
 async def _fd_pace() -> None:
-    """Sleep just enough to keep football-data.org calls at or under
-    FOOTBALL_DATA_MIN_INTERVAL_SECONDS apart. Applied to the new
-    form/H2H/standings endpoints; the original fixtures loop keeps its own
-    existing per-competition sleep(1) unchanged."""
     global _fd_last_request_time
     now = time.time()
     wait = FOOTBALL_DATA_MIN_INTERVAL_SECONDS - (now - _fd_last_request_time)
@@ -807,11 +786,6 @@ async def _fd_pace() -> None:
 
 
 async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None) -> dict:
-    """Shared GET helper for the three new football-data.org endpoints:
-    paces every attempt, and on a 429 retries up to FOOTBALL_DATA_MAX_RETRIES
-    times, honoring the server's Retry-After header when present instead of
-    guessing. Raises on final failure (including a 429 that never clears) so
-    each caller's existing try/except still turns that into a clean {}."""
     last_exc: Exception | None = None
     for attempt in range(FOOTBALL_DATA_MAX_RETRIES + 1):
         await _fd_pace()
@@ -822,7 +796,7 @@ async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None)
         )
         if resp.status_code == 429:
             if attempt >= FOOTBALL_DATA_MAX_RETRIES:
-                resp.raise_for_status()  # exhausted retries — let caller's except handle it
+                resp.raise_for_status()
             retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
             try:
                 wait = float(retry_after) if retry_after else FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS
@@ -846,9 +820,6 @@ async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None)
 
 
 async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dict[int, dict]:
-    """Returns {team_id: {"position", "points", "played", "goal_diff"}} for
-    the given competition's current TOTAL table. Empty dict on any failure —
-    callers must treat a missing team as UNKNOWN, not assume last place."""
     try:
         data = await _fd_get(http, f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/standings")
     except Exception as e:
@@ -873,10 +844,6 @@ async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dic
 
 
 async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
-    """Returns {"results": "WLDWW" (most recent first), "matches_considered",
-    "goals_for", "goals_against"} from the team's last 5 FINISHED matches
-    across all competitions. Empty dict on any failure or if no finished
-    matches are found — callers must treat that as UNKNOWN, not "0 wins"."""
     try:
         data = await _fd_get(
             http,
@@ -912,10 +879,6 @@ async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
 
 
 async def fetch_head_to_head(http: httpx.AsyncClient, fixture_id: int) -> dict:
-    """Returns {"matches_played", "home_wins", "draws", "away_wins"} from the
-    real head-to-head aggregate for this exact fixture (last 10 meetings).
-    Empty dict on any failure — callers must treat that as UNKNOWN, not
-    "no history"."""
     try:
         data = await _fd_get(
             http,
@@ -1102,12 +1065,6 @@ async def fetch_weather(venue_city: str | None) -> dict:
 def _extract_json(text: str) -> dict:
     if not text:
         return {}
-    # Defensive backstop: reasoning_format="hidden" should already keep
-    # <think> blocks out of `content` entirely, but if a model ever leaks
-    # one anyway, strip it rather than let it defeat every parse strategy
-    # below. A dangling unclosed <think> (model ran out of budget mid-
-    # thought) is stripped too by treating everything from the opening tag
-    # onward as reasoning noise.
     if "<think>" in text:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
@@ -1133,13 +1090,25 @@ def _extract_json(text: str) -> dict:
 
 
 def analyze_with_groq(raw_data: dict) -> dict:
-    text = _groq_chat(
-        max_tokens=2048,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"""Analyze this raw fixture data and return structured match intelligence JSON.
+    # A RuntimeError here (Groq rate-limited across the whole fallback chain,
+    # with a wait too long to block on — see GROQ_MAX_SINGLE_WAIT_SECONDS)
+    # previously propagated straight out of this function, through
+    # _deep_analyze, and out of the batch loop in run() — crashing the
+    # entire Scout phase and discarding every fixture already analyzed
+    # earlier in the same run, each of which cost several real
+    # football-data.org calls to assemble. Converting it to {} here instead
+    # routes it through the exact same "couldn't get anything usable from
+    # the LLM" path _deep_analyze already has for a parse failure (see the
+    # skeleton-building fallback there) — so one fixture Groq can't serve
+    # right now costs just that fixture, not the whole batch.
+    try:
+        text = _groq_chat(
+            max_tokens=2048,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"""Analyze this raw fixture data and return structured match intelligence JSON.
 
 RAW DATA:
 {raw_data}
@@ -1167,9 +1136,11 @@ Return a JSON object with this structure (and nothing else):
             }
         ],
     )
+    except RuntimeError as e:
+        logger.error(f"[SCOUT] analyze_with_groq: Groq unavailable ({e}) — returning empty result.")
+        return {}
     result = _extract_json(text)
 
-    # Guard: if the model returned a list instead of a dict, unwrap it
     if isinstance(result, list):
         logger.warning("[SCOUT] LLM returned a list instead of a dict — unwrapping first element.")
         result = result[0] if result and isinstance(result[0], dict) else {}
@@ -1204,8 +1175,6 @@ async def _deep_analyze(
     home_id = fixture.get("homeTeam", {}).get("id")
     away_id = fixture.get("awayTeam", {}).get("id")
 
-    # Try to get venue city from the API response first,
-    # then fall back to our home-team lookup table.
     venue_city = (
         fixture.get("venue")
         or fixture.get("homeTeam", {}).get("venue")
@@ -1226,12 +1195,6 @@ async def _deep_analyze(
 
     weather = await fetch_weather(venue_city)
 
-    # Real recent-form / head-to-head / standings data (see the comment
-    # block above FOOTBALL_DATA_BASE for why this exists at all: previously
-    # nothing fetched this, and the LLM was inventing it wholesale). Cached
-    # per team/competition across the whole run so a team appearing in
-    # multiple fixtures, or a competition with several fixtures today,
-    # doesn't refetch the same data repeatedly.
     if ENABLE_REAL_FORM_DATA:
         if competition_code and competition_code not in standings_cache:
             standings_cache[competition_code] = await fetch_standings(fd_http, competition_code)
@@ -1257,8 +1220,6 @@ async def _deep_analyze(
         "away_injuries": away_injuries,
         "weather": weather,
         "venue_city": venue_city,
-        # Real data, or {} meaning genuinely UNKNOWN — SYSTEM_PROMPT
-        # instructs the model these are never to be invented.
         "recent_form": {"home": home_form, "away": away_form},
         "head_to_head": head_to_head,
         "standings": {"home": home_standing, "away": away_standing},
@@ -1266,7 +1227,6 @@ async def _deep_analyze(
 
     structured = analyze_with_groq(raw)
 
-    # If LLM returned nothing usable, build a minimal skeleton so we don't crash
     if not structured:
         logger.warning(f"[SCOUT] analyze_with_groq returned empty result for {home_name} vs {away_name} — using skeleton.")
         structured = {
@@ -1350,11 +1310,6 @@ async def run(target_date: date | None = None) -> list[dict]:
     cursor = 0
     is_first_batch = True
 
-    # Caches live for the whole run: a team appearing in more than one
-    # fixture today, or a competition with several fixtures, only needs
-    # its standings/form fetched once. fd_http is a single shared client so
-    # the new football-data.org calls (standings/form/head2head) reuse
-    # connections instead of opening one per request.
     standings_cache: dict[str, dict] = {}
     team_form_cache: dict[int, dict] = {}
 
@@ -1375,8 +1330,6 @@ async def run(target_date: date | None = None) -> list[dict]:
                     fixture, odds_event, epl_injuries, fd_http, standings_cache, team_form_cache
                 )
                 results.append(structured)
-                # No fixed sleep here anymore — analyze_with_groq's _groq_chat call
-                # already paces itself against the real rolling TPM budget.
 
             qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
             logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
