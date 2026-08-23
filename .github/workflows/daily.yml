@@ -50,4 +50,8 @@ jobs:
           # will actually override anything.
           LEAGUE_IDS: ${{ github.event.inputs.league_ids }}
           CLEANER_THRESHOLD: ${{ github.event.inputs.cleaner_threshold }}
+          # Publish risk-approved selections even when the model edge is up to
+          # 10 percentage points below the bookmaker-implied probability.
+          # This is intentionally less conservative than the default 0.03.
+          MIN_EDGE_MARGIN: "-0.10"
         run: python -m backend.daily_run
