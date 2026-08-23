@@ -10,462 +10,12 @@ import os
 import re
 import time
 from datetime import date
-from typing import Any
 
 import httpx
-from groq import Groq, NotFoundError, RateLimitError
+
+from backend.gemini_client import gemini_chat as _gemini_chat, get_last_finish_reason
 
 logger = logging.getLogger(__name__)
-# max_retries=0: we do our own TPM-aware pacing + retry (see _groq_chat below)
-# instead of relying on the SDK's blind exponential backoff.
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"), max_retries=0)
-
-# Model fallback chain: on a daily-quota 429 (RPD/TPD) we switch to the next
-# model rather than sleeping out a multi-minute daily cooldown, since each
-# model on Groq carries its own independent daily budget.
-#
-# NOTE: Groq deprecates/retires models on short notice (llama-3.1-8b-instant
-# and llama-3.3-70b-versatile were both shut down Aug 16, 2026). If a model
-# here starts 404ing, check https://console.groq.com/docs/models for the
-# current lineup and update this list — the code below treats a 404 as
-# "unusable, skip it" rather than crashing, but a stale chain still means
-# fewer real fallback options in practice.
-GROQ_MODEL_FALLBACK_CHAIN = [
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.6-27b",
-]
-_current_model_index = 0
-
-# ---------------------------------------------------------------------------
-# Reasoning control.
-#
-# All three models in the chain are *reasoning* models. Left on default
-# settings they write out a full chain-of-thought as plain text before (or
-# instead of) answering, and that reasoning counts as ordinary output
-# tokens — it burns through the TPM budget fast, regularly blows past
-# max_tokens (triggering the truncation-retry path over and over), and on
-# qwen specifically can consume the entire response and hit
-# finish_reason="stop" having never emitted the requested JSON at all,
-# which _extract_json then correctly fails to parse.
-#
-# All three models support reasoning_effort (per console.groq.com/docs/
-# reasoning and the qwen3.6-27b model card, checked 2026-08-22), but the
-# valid values — and what they actually MEAN — differ by family in a way
-# that matters a lot for a token-budgeted pipeline:
-#   - gpt-oss (20b/120b): "low" | "medium" | "high" — three genuinely
-#     bounded steps on the same scale.
-#   - qwen3.6-27b: "none" | "default" — NOT bounded steps. Per Groq's own
-#     model card, "default" is literally "thinking mode... for complex
-#     reasoning, math, and coding" — genuinely open-ended chain-of-thought
-#     with no built-in ceiling. Real-world reports on this model family
-#     show it burning 20,000+ reasoning tokens on trivial requests when
-#     left in this mode; in Football Pulse AI's Portfolio agent (a
-#     different file, backend/agents/pipeline_agents.py) this exact setting
-#     caused finish_reason="length" with completely EMPTY content even
-#     after doubling max_tokens, because the model was spending the whole
-#     budget on invisible reasoning with no ceiling to hit.
-#
-# Scout's job here (turn raw fixture data into structured JSON) is bounded
-# structured-output work, not open-ended reasoning, so "minimal" is used
-# for every call — which already avoids qwen's "default"/thinking-mode trap
-# entirely. The "default" entry below is kept only so the mapping stays
-# consistent with pipeline_agents.py's table; qwen maps "default" to "none"
-# (not "default") for the same reason described there — qwen has no bounded
-# middle ground the way gpt-oss does, so nothing in this pipeline should
-# ever put qwen into its literal thinking mode.
-_REASONING_EFFORT_BY_FAMILY: dict[str, dict[str, str]] = {
-    "gpt-oss": {"minimal": "low", "default": "medium"},
-    "qwen": {"minimal": "none", "default": "none"},
-}
-
-
-def _reasoning_extra_body(model: str, desired: str) -> dict[str, str]:
-    """Build the extra_body payload controlling reasoning for `model`.
-
-    Returns {} for any model not in _REASONING_EFFORT_BY_FAMILY (i.e. a
-    future non-reasoning model added to the chain) so we never send a
-    reasoning param a model doesn't understand.
-    """
-    for family, effort_map in _REASONING_EFFORT_BY_FAMILY.items():
-        if family in model:
-            effort = effort_map.get(desired, effort_map["minimal"])
-            return {"reasoning_effort": effort, "reasoning_format": "hidden"}
-    return {}
-
-
-# Set by _groq_chat right before returning, so callers can enrich their own
-# parse-error logs with *why* the content was empty without changing
-# _groq_chat's return type everywhere it's called.
-_last_finish_reason: str | None = None
-
-
-def _current_model() -> str:
-    return GROQ_MODEL_FALLBACK_CHAIN[_current_model_index]
-
-
-def _switch_to_next_model() -> bool:
-    global _current_model_index
-    if _current_model_index >= len(GROQ_MODEL_FALLBACK_CHAIN) - 1:
-        return False
-    _current_model_index += 1
-    logger.warning(
-        f"[FALLBACK] Switching to {_current_model()}"
-    )
-    return True
-
-
-def _is_daily_limit_error(err: RateLimitError) -> bool:
-    msg = str(err).lower()
-    return "per day" in msg or "tpd" in msg or "rpd" in msg
-
-
-# ---------------------------------------------------------------------------
-# Rate limit configuration
-#
-# Verified against https://console.groq.com/docs/rate-limits (checked
-# 2026-08-22). All three models currently in GROQ_MODEL_FALLBACK_CHAIN share
-# the same free-tier limits:
-#
-#     RPM=30   RPD=1,000   TPM=8,000   TPD=200,000
-#
-# IMPORTANT: this file previously assumed a flat 18,000 TPM budget
-# (GROQ_TPM_LIMIT env default) for every model — more than double the real
-# 8,000 TPM cap. That mismatch is exactly why the daily run was getting
-# 429'd on almost every call even with pacing in place: the pacer thought
-# it had headroom it didn't actually have.
-#
-# Two things Groq's response headers do and don't tell you:
-#   - x-ratelimit-remaining-tokens / x-ratelimit-reset-tokens: TPM, and it's
-#     authoritative — we read these off every response and prefer them over
-#     our own estimate whenever they're fresh.
-#   - RPM is NOT exposed in headers at all (only RPD is, confusingly under
-#     the name x-ratelimit-remaining-requests). So RPM has to be paced
-#     locally from a rolling request-timestamp log; there's no way to read
-#     the real-time figure from Groq directly.
-#
-# If Groq changes these limits, or the fallback chain gains a model with
-# different limits, update MODEL_LIMITS accordingly — check the current
-# table at console.groq.com/docs/rate-limits.
-MODEL_LIMITS: dict[str, dict[str, int]] = {
-    "openai/gpt-oss-20b": {"rpm": 30, "tpm": 8000},
-    "openai/gpt-oss-120b": {"rpm": 30, "tpm": 8000},
-    "qwen/qwen3.6-27b": {"rpm": 30, "tpm": 8000},
-}
-_DEFAULT_MODEL_LIMITS = {"rpm": 30, "tpm": 8000}
-
-# Safety margin: pace against this fraction of the documented cap, not the
-# full cap, so normal jitter/estimation error doesn't still land us on a 429.
-GROQ_SAFETY_MARGIN = 0.85
-
-GROQ_TPM_WINDOW_SECONDS = 60
-GROQ_RPM_WINDOW_SECONDS = 60
-
-# Local retries *per model* before we fall forward to the next model in the
-# chain (if any remain). Previously this was a flat 4 retries with no
-# forward-fallback on plain rate-limit exhaustion — only on errors that
-# explicitly said "per day" — which meant a model stuck in a tight
-# per-minute rate-limit loop could exhaust all retries and crash the whole
-# scout run even while other models in the chain sat completely unused.
-GROQ_MAX_LOCAL_RETRIES = 4
-
-# Ceiling for the truncation retry in _groq_chat. Reasoning models can run
-# out of max_tokens two different ways: (1) spend the entire budget on
-# hidden chain-of-thought and return empty content, or (2) spend it
-# mid-answer and return a cut-off, non-empty-but-invalid partial response.
-# Both show up as finish_reason="length" — content emptiness is not a
-# reliable signal on its own, so the retry keys off finish_reason alone.
-GROQ_TRUNCATION_RETRY_CEILING = 6000
-
-# Hard ceiling on any SINGLE sleep this module will ever perform for a 429.
-# See the matching constant/comment in pipeline_agents.py for the full
-# story: a production run hit sleeping 1428.0s (~24 minutes) in a single
-# call on the LAST model in the fallback chain, when it hit a
-# daily-quota-flavored 429 with nowhere left to fall forward to — and got
-# the whole CI job killed mid-sleep as a result, discarding every fixture
-# already analyzed earlier in the same run. Any wait longer than this is
-# treated as "not going to resolve within a time-boxed pipeline run": fall
-# forward to a fresh model if one remains, otherwise give up on this one
-# call via RuntimeError so the caller can skip just this fixture.
-GROQ_MAX_SINGLE_WAIT_SECONDS = float(os.environ.get("GROQ_MAX_SINGLE_WAIT_SECONDS", "90"))
-
-
-# ---------------------------------------------------------------------------
-# Per-model rate limit state, keyed by model name so switching back and
-# forth in the chain doesn't lose pacing history for a given model.
-class _ModelRateState:
-    __slots__ = (
-        "request_times",
-        "token_log",
-        "header_remaining_tokens",
-        "header_reset_tokens_at",
-    )
-
-    def __init__(self) -> None:
-        self.request_times: list[float] = []
-        self.token_log: list[tuple[float, int]] = []
-        self.header_remaining_tokens: int | None = None
-        self.header_reset_tokens_at: float | None = None  # absolute time.time()
-
-
-_model_states: dict[str, _ModelRateState] = {}
-
-
-def _state_for(model: str) -> _ModelRateState:
-    if model not in _model_states:
-        _model_states[model] = _ModelRateState()
-    return _model_states[model]
-
-
-def _limits_for(model: str) -> dict[str, int]:
-    return MODEL_LIMITS.get(model, _DEFAULT_MODEL_LIMITS)
-
-
-def _parse_reset_duration(value: str | None) -> float:
-    """Parse Groq's reset-time header format into seconds.
-
-    Observed formats: "7.66s", "2m59.56s", "120ms", "1.2s".
-    Returns 0.0 if the value is missing or unparseable.
-    """
-    if not value:
-        return 0.0
-    value = value.strip()
-    if value.endswith("ms"):
-        try:
-            return float(value[:-2]) / 1000.0
-        except ValueError:
-            return 0.0
-    m = re.match(r"^(?:(\d+)m)?(?:([\d.]+)s)?$", value)
-    if not m or (m.group(1) is None and m.group(2) is None):
-        return 0.0
-    minutes = float(m.group(1)) if m.group(1) else 0.0
-    seconds = float(m.group(2)) if m.group(2) else 0.0
-    return minutes * 60 + seconds
-
-
-def _record_headers(model: str, headers: Any) -> None:
-    """Pull the authoritative TPM figures Groq hands back on every response
-    (success or 429) so the next _pace_before_call for this model can use
-    real numbers instead of only a local estimate."""
-    if headers is None:
-        return
-    state = _state_for(model)
-    try:
-        remaining = headers.get("x-ratelimit-remaining-tokens")
-        reset = headers.get("x-ratelimit-reset-tokens")
-    except AttributeError:
-        return
-    if remaining is None:
-        return
-    try:
-        state.header_remaining_tokens = int(remaining)
-    except (TypeError, ValueError):
-        return
-    reset_seconds = _parse_reset_duration(reset)
-    state.header_reset_tokens_at = time.time() + reset_seconds
-
-
-def _prune(log: list, cutoff: float, key=lambda item: item) -> None:
-    while log and key(log[0]) < cutoff:
-        log.pop(0)
-
-
-def _pace_before_call(model: str, estimated_tokens: int) -> None:
-    """Sleep only if firing now would push us over this model's RPM or TPM
-    budget. Prefers Groq's own header-reported TPM figures when fresh;
-    falls back to a local rolling-window estimate otherwise (e.g. on the
-    first call to a model, before we've seen any headers for it yet).
-    """
-    now = time.time()
-    state = _state_for(model)
-    limits = _limits_for(model)
-    rpm_cap = max(1, int(limits["rpm"] * GROQ_SAFETY_MARGIN))
-    tpm_cap = max(1, int(limits["tpm"] * GROQ_SAFETY_MARGIN))
-
-    # --- RPM pacing (local-only; Groq doesn't expose this in headers) ---
-    _prune(state.request_times, now - GROQ_RPM_WINDOW_SECONDS)
-    if len(state.request_times) >= rpm_cap:
-        oldest = state.request_times[0]
-        wait = (oldest + GROQ_RPM_WINDOW_SECONDS) - now
-        if wait > 0:
-            logger.info(
-                f"[RATE LIMIT] {model}: {len(state.request_times)}/{rpm_cap} "
-                f"requests in the last {GROQ_RPM_WINDOW_SECONDS}s — pacing {wait:.1f}s"
-            )
-            time.sleep(wait)
-            now = time.time()
-
-    # --- TPM pacing: prefer Groq's own header figures when fresh ---
-    if (
-        state.header_remaining_tokens is not None
-        and state.header_reset_tokens_at is not None
-        and now < state.header_reset_tokens_at
-    ):
-        if state.header_remaining_tokens < estimated_tokens:
-            wait = state.header_reset_tokens_at - now
-            if wait > 0:
-                logger.info(
-                    f"[RATE LIMIT] {model}: Groq reports only "
-                    f"{state.header_remaining_tokens} tokens left this window "
-                    f"(need ~{estimated_tokens}) — pacing {wait:.1f}s"
-                )
-                time.sleep(wait)
-        return
-
-    # Fallback: no fresh header reading yet for this model — estimate from
-    # our own local log against the documented (safety-margined) TPM cap.
-    _prune(state.token_log, now - GROQ_TPM_WINDOW_SECONDS, key=lambda item: item[0])
-    used = sum(tokens for _, tokens in state.token_log)
-    if used + estimated_tokens <= tpm_cap:
-        return
-    oldest_ts = state.token_log[0][0]
-    wait = (oldest_ts + GROQ_TPM_WINDOW_SECONDS) - now
-    if wait > 0:
-        logger.info(
-            f"[RATE LIMIT] {model}: {used}+{estimated_tokens} tokens would "
-            f"exceed the ~{tpm_cap} TPM budget — pacing {wait:.1f}s"
-        )
-        time.sleep(wait)
-
-
-def _retry_after_seconds(err: RateLimitError) -> float | None:
-    try:
-        header = err.response.headers.get("retry-after")
-        return float(header) if header is not None else None
-    except (AttributeError, TypeError, ValueError):
-        return None
-
-
-def _groq_chat(
-    *,
-    max_tokens: int,
-    messages: list[dict],
-    reasoning_effort: str = "minimal",
-) -> str:
-    """Single choke point for every Groq call in Scout: paces requests
-    against the active model's real RPM/TPM budget (preferring Groq's own
-    response headers over local estimates once we have them), falls forward
-    to the next model in the chain on a daily-quota 429 OR on exhausting
-    local retries for a per-minute limit, and otherwise backs off using the
-    server's Retry-After header instead of failing the whole run.
-
-    Also guards against reasoning models running out of max_tokens before
-    finishing — signaled by finish_reason="length" — by bumping max_tokens
-    (up to GROQ_TRUNCATION_RETRY_CEILING) and retrying the same call.
-    """
-    global _last_finish_reason
-    prompt_chars = sum(len(m.get("content", "")) for m in messages)
-
-    attempt = 0
-    while True:
-        model = _current_model()
-        estimated_tokens = (prompt_chars // 4) + max_tokens
-        _pace_before_call(model, estimated_tokens)
-
-        kwargs: dict[str, Any] = dict(
-            model=model,
-            max_tokens=max_tokens,
-            messages=messages,
-        )
-        # groq==0.11.0's typed create() signature predates gpt-oss/qwen3.6
-        # reasoning support — extra_body merges reasoning_effort/format
-        # straight into the raw JSON request instead.
-        extra_body = _reasoning_extra_body(model, reasoning_effort)
-        if extra_body:
-            kwargs["extra_body"] = extra_body
-
-        try:
-            try:
-                raw = client.chat.completions.with_raw_response.create(**kwargs)
-                _record_headers(model, getattr(raw, "headers", None))
-                response = raw.parse()
-            except AttributeError:
-                response = client.chat.completions.create(**kwargs)
-        except RateLimitError as e:
-            _record_headers(model, getattr(getattr(e, "response", None), "headers", None))
-            if _is_daily_limit_error(e) and _switch_to_next_model():
-                attempt = 0
-                continue  # new model, new budget — retry now, no sleep needed
-
-            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
-
-            # Never block this long inside a time-boxed pipeline run — see
-            # GROQ_MAX_SINGLE_WAIT_SECONDS above. Checked BEFORE the
-            # attempt-count threshold on purpose: the dangerous case is a
-            # huge wait on the very FIRST attempt, which an attempt-count
-            # gate alone never catches (it only falls forward after
-            # GROQ_MAX_LOCAL_RETRIES is already exhausted).
-            if wait > GROQ_MAX_SINGLE_WAIT_SECONDS:
-                logger.warning(
-                    f"[RATE LIMIT] {model} reports a {wait:.0f}s wait — too long "
-                    f"to block on inside this pipeline"
-                )
-                if _switch_to_next_model():
-                    attempt = 0
-                    continue
-                raise RuntimeError(
-                    f"Groq API: {model} reports a {wait:.0f}s rate-limit wait "
-                    f"with no fallback model remaining in the chain — giving "
-                    f"up on this call rather than blocking the whole run."
-                ) from e
-
-            attempt += 1
-            if attempt >= GROQ_MAX_LOCAL_RETRIES:
-                # Exhausted local retries on this model for a per-minute
-                # limit. Fall forward to the next model in the chain before
-                # giving up, same as we already do for daily-quota errors.
-                if _switch_to_next_model():
-                    logger.warning(
-                        f"[FALLBACK] {model} exhausted {GROQ_MAX_LOCAL_RETRIES} "
-                        f"local retries on a per-minute rate limit — "
-                        f"falling forward to {_current_model()}"
-                    )
-                    attempt = 0
-                    continue
-                raise RuntimeError(
-                    f"Groq API: still rate-limited on {model} after "
-                    f"{GROQ_MAX_LOCAL_RETRIES} local retries, and no fallback "
-                    f"models remain in the chain."
-                ) from e
-
-            logger.warning(
-                f"[RATE LIMIT] Groq 429 on {model} "
-                f"(attempt {attempt}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
-            )
-            time.sleep(wait)
-            continue
-        except NotFoundError as e:
-            logger.error(f"[FALLBACK] {model} unavailable ({e}) — trying next model")
-            if _switch_to_next_model():
-                attempt = 0
-                continue
-            raise RuntimeError(
-                f"Groq API: {model} unavailable and no fallback models remain"
-            ) from e
-
-        usage = getattr(response, "usage", None)
-        actual_tokens = getattr(usage, "total_tokens", None) or estimated_tokens
-        state = _state_for(model)
-        now = time.time()
-        state.request_times.append(now)
-        state.token_log.append((now, actual_tokens))
-
-        content = response.choices[0].message.content
-        finish_reason = getattr(response.choices[0], "finish_reason", None)
-        _last_finish_reason = finish_reason
-
-        if finish_reason == "length" and max_tokens < GROQ_TRUNCATION_RETRY_CEILING:
-            bumped = min(max_tokens * 2, GROQ_TRUNCATION_RETRY_CEILING)
-            preview = (content or "")[:80]
-            logger.warning(
-                f"[TRUNCATED] {model} hit its {max_tokens}-token limit "
-                f"before finishing (finish_reason=length, content={'empty' if not content else f'partial: {preview!r}'}) "
-                f"— retrying with max_tokens={bumped}"
-            )
-            max_tokens = bumped
-            continue
-
-        return content or ""
 
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
@@ -1089,9 +639,9 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
-def analyze_with_groq(raw_data: dict) -> dict:
-    # A RuntimeError here (Groq rate-limited across the whole fallback chain,
-    # with a wait too long to block on — see GROQ_MAX_SINGLE_WAIT_SECONDS)
+def analyze_with_gemini(raw_data: dict) -> dict:
+    # A RuntimeError here (Gemini rate-limited across the whole fallback chain,
+    # with a wait too long to block on — see GEMINI_MAX_SINGLE_WAIT_SECONDS)
     # previously propagated straight out of this function, through
     # _deep_analyze, and out of the batch loop in run() — crashing the
     # entire Scout phase and discarding every fixture already analyzed
@@ -1099,10 +649,10 @@ def analyze_with_groq(raw_data: dict) -> dict:
     # football-data.org calls to assemble. Converting it to {} here instead
     # routes it through the exact same "couldn't get anything usable from
     # the LLM" path _deep_analyze already has for a parse failure (see the
-    # skeleton-building fallback there) — so one fixture Groq can't serve
+    # skeleton-building fallback there) — so one fixture Gemini can't serve
     # right now costs just that fixture, not the whole batch.
     try:
-        text = _groq_chat(
+        text = _gemini_chat(
             max_tokens=2048,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -1137,7 +687,7 @@ Return a JSON object with this structure (and nothing else):
         ],
     )
     except RuntimeError as e:
-        logger.error(f"[SCOUT] analyze_with_groq: Groq unavailable ({e}) — returning empty result.")
+        logger.error(f"[SCOUT] analyze_with_gemini: Gemini unavailable ({e}) — returning empty result.")
         return {}
     result = _extract_json(text)
 
@@ -1148,7 +698,7 @@ Return a JSON object with this structure (and nothing else):
     if not isinstance(result, dict):
         logger.error(
             f"[SCOUT] Failed to parse LLM response as JSON object "
-            f"(finish_reason={_last_finish_reason}): {text[:200]}"
+            f"(finish_reason={get_last_finish_reason()}): {text[:200]}"
         )
         return {}
 
@@ -1225,10 +775,10 @@ async def _deep_analyze(
         "standings": {"home": home_standing, "away": away_standing},
     }
 
-    structured = analyze_with_groq(raw)
+    structured = analyze_with_gemini(raw)
 
     if not structured:
-        logger.warning(f"[SCOUT] analyze_with_groq returned empty result for {home_name} vs {away_name} — using skeleton.")
+        logger.warning(f"[SCOUT] analyze_with_gemini returned empty result for {home_name} vs {away_name} — using skeleton.")
         structured = {
             "fixture_id": fixture_id,
             "home_team": home_name,
