@@ -254,6 +254,20 @@ IMPORTANT OUTPUT RULES:
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.60"))
 MIN_EDGE_MARGIN = float(os.environ.get("MIN_EDGE_MARGIN", "0.03"))
 
+# ---------------------------------------------------------------------------
+# Combined-odds band — was a flat 8.0-13.0 hardcoded in 6 separate places
+# (2 prompt strings + 4 code checks/messages). Widened per request: 8-13 was
+# rejecting entire days' worth of tickets (e.g. 2026-08-23: only 3 matches
+# cleared risk filtering, and no 2-5 combination of them could land in that
+# narrow a band even though each individual selection still had to pass its
+# own MIN_EDGE_MARGIN value check). The value/edge requirement per selection
+# is unchanged and unaffected by this — this band only controls how many
+# selections get combined together, not whether any given selection is
+# worth taking.
+COMBINED_ODDS_MIN = float(os.environ.get("COMBINED_ODDS_MIN", "5.0"))
+COMBINED_ODDS_MAX = float(os.environ.get("COMBINED_ODDS_MAX", "20.0"))
+COMBINED_ODDS_TARGET = (COMBINED_ODDS_MIN + COMBINED_ODDS_MAX) / 2
+
 ANALYST_PROMPT = """You are the ANALYST AGENT for Football Pulse AI.
 You receive clean match data and must estimate probabilities for each market.
 
@@ -355,11 +369,12 @@ You do NOT calculate odds yourself — odds will be looked up from the match dat
 by the system after you choose. Focus purely on WHICH match + market combinations
 to select.
 
-TARGET: combined odds of approximately 10.0 (acceptable range: 8.0-13.0).
+TARGET: combined odds of approximately {COMBINED_ODDS_TARGET:.1f} (acceptable range: {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f}).
 
 IMPORTANT — Double Chance markets typically have odds between 1.05 and 1.35.
 Multiplying 3-4 Double Chance picks together usually only reaches 1.3-2.5,
-NOT 10.0. To reach the ~10.0 target you will typically need a MIX:
+which may not be enough on its own. To reach the target you will typically
+need a MIX:
 - 1-2 safer picks (Double Chance, Draw No Bet, odds ~1.1-1.4), AND
 - 2-3 higher-odds picks (BTTS, Over 2.5, or even an outright win for a
   team that is favoured but not overwhelmingly so, odds ~1.5-3.0)
@@ -382,7 +397,7 @@ combination that's likely to land in range.
 RULES:
 - Selections: 2-5 only
 - Prefer matches where model_confidence is highest
-- If you cannot construct a combination likely to reach 8.0+, output decision NO_BET
+- If you cannot construct a combination likely to reach {COMBINED_ODDS_MIN:.1f}+, output decision NO_BET
 
 MARKET PREFERENCE (use these exact market keys):
 - double_chance_home / double_chance_away
@@ -405,7 +420,7 @@ home_win, draw, away_win, btts_yes, over25, double_chance_home,
 double_chance_away, draw_no_bet_home, draw_no_bet_away).
 
 Output JSON: {{"selections": [{{"fixture_id": int, "market": str, "rationale": str}}], "portfolio_confidence": float, "rationale": str}}
-If you cannot build a combination likely to reach 8.0+, output: {{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
+If you cannot build a combination likely to reach {COMBINED_ODDS_MIN:.1f}+, output: {{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
 
 AUDITOR_PROMPT = """You are the AUDITOR AGENT for Football Pulse AI.
 Act as the devil's advocate. Your job is to CHALLENGE every selection.
@@ -430,7 +445,7 @@ bookmaker odds — you do not need to recalculate it, only check it falls in ran
 
 PUBLISH IF:
 - Overall confidence >= {CONFIDENCE_THRESHOLD:.2f} ({CONFIDENCE_THRESHOLD * 100:.0f}%)
-- Combined odds within 8.0-13.0
+- Combined odds within {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f}
 - At least 2 selections passed auditor review
 - No HARD REJECT flags active
 - Auditor verdict is APPROVE or REVISE (with acceptable adjustments)
@@ -1077,7 +1092,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     match_lookup = {m.get("fixture_id"): m for m in safe_matches}
 
     # This is the most reasoning-heavy call in the pipeline — it has to weigh
-    # combinations across every safe candidate to hit an 8.0-13.0 combined-odds
+    # combinations across every safe candidate to hit the target combined-odds
     # target, so unlike every other call in this file it opts into "default"
     # reasoning effort rather than "minimal" (maps to gpt-oss "medium" — a
     # bounded step. On qwen it now maps to "none", same as "minimal", because
@@ -1286,16 +1301,17 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
                 f"Original reasoning: {data.get('reason', '')}"
             )
 
-    if combined_odds is not None and not (8.0 <= combined_odds <= 13.0):
+    if combined_odds is not None and not (COMBINED_ODDS_MIN <= combined_odds <= COMBINED_ODDS_MAX):
         if data.get("decision") == "PUBLISH":
             logger.warning(
                 f"[DECISION] Overriding LLM's PUBLISH -> NO_BET: "
-                f"combined_odds={combined_odds} outside 8.0-13.0 range"
+                f"combined_odds={combined_odds} outside {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f} range"
             )
         data["decision"] = "NO_BET"
         data["reason"] = (
             f"Overridden to NO_BET: combined_odds ({combined_odds}) is outside "
-            f"the required 8.0-13.0 range. Original reasoning: {data.get('reason', '')}"
+            f"the required {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f} range. "
+            f"Original reasoning: {data.get('reason', '')}"
         )
 
     return data
