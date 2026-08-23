@@ -217,7 +217,7 @@ GROQ_TRUNCATION_RETRY_CEILING = 6000
 # right now beats waiting out an unknown-length quota), and if none remain,
 # give up on this one call via RuntimeError rather than blocking — the
 # caller (run_analyst / run_risk_filter) is responsible for catching that
-# and skipping just this one item instead of losing the whole batch.
+# and skipping just this item instead of losing the whole batch.
 GROQ_MAX_SINGLE_WAIT_SECONDS = float(os.environ.get("GROQ_MAX_SINGLE_WAIT_SECONDS", "90"))
 
 JSON_RULES = """
@@ -666,6 +666,15 @@ def _pace_before_call(model: str, estimated_tokens: int) -> None:
     used = sum(tokens for _, tokens in state.token_log)
     if used + estimated_tokens <= tpm_cap:
         return
+    # Guard: if the log is empty (e.g. right after a model switch, or the
+    # very first call this run), there's nothing to "wait out" — a large
+    # batched call can legitimately need more tokens than the whole TPM cap
+    # on its own. Blindly indexing state.token_log[0] here would raise
+    # IndexError; instead just proceed and let the normal 429/retry/fallback
+    # path in _groq_chat handle it if the estimate turns out to be too
+    # optimistic.
+    if not state.token_log:
+        return
     oldest_ts = state.token_log[0][0]
     wait = (oldest_ts + GROQ_TPM_WINDOW_SECONDS) - now
     if wait > 0:
@@ -689,6 +698,7 @@ def _groq_chat(
     max_tokens: int,
     messages: list[dict],
     reasoning_effort: str = "minimal",
+    truncation_ceiling: int = GROQ_TRUNCATION_RETRY_CEILING,
 ) -> str:
     """Single choke point for every Groq call: paces requests against the
     active model's real RPM/TPM budget (per console.groq.com/docs/rate-limits,
@@ -707,13 +717,18 @@ def _groq_chat(
     "default" to "none" too, since qwen's "default" is unbounded thinking
     mode, not a bounded step (see _REASONING_EFFORT_BY_FAMILY for why).
 
+    `truncation_ceiling` overrides GROQ_TRUNCATION_RETRY_CEILING for calls
+    whose expected output is larger than a single match's worth (e.g. a
+    batched Analyst/Risk call covering several matches in one request) — the
+    default is still right for the common single-item case.
+
     Also guards against reasoning models running out of max_tokens before
     finishing their answer — signaled by finish_reason="length" — which can
     surface as either empty content (whole budget spent on hidden
     chain-of-thought) or non-empty-but-truncated content (e.g. a JSON object
     cut off mid-string). Both are real 200 OK responses that look like parse
     errors downstream, so we key off finish_reason itself rather than
-    content emptiness, and bump max_tokens (up to GROQ_TRUNCATION_RETRY_CEILING)
+    content emptiness, and bump max_tokens (up to truncation_ceiling)
     and retry the same call before giving up.
     """
     global _last_finish_reason
@@ -842,8 +857,8 @@ def _groq_chat(
         # call can come back with SOME content (a cut-off JSON string) just
         # as easily as none (whole budget spent on hidden reasoning), and
         # both are equally unusable to the caller.
-        if finish_reason == "length" and max_tokens < GROQ_TRUNCATION_RETRY_CEILING:
-            bumped = min(max_tokens * 2, GROQ_TRUNCATION_RETRY_CEILING)
+        if finish_reason == "length" and max_tokens < truncation_ceiling:
+            bumped = min(max_tokens * 2, truncation_ceiling)
             preview = (content or "")[:80]
             logger.warning(
                 f"[TRUNCATED] {model} hit its {max_tokens}-token limit "
@@ -907,33 +922,84 @@ def _valid(odds: float | None) -> float | None:
     return odds
 
 
+# ---------------------------------------------------------------------------
+# Analyst / Risk batching.
+#
+# Root cause of the 2026-08-23 NO_BET: it wasn't a code bug at all — every
+# fix up to this point worked exactly as designed (no crash, no long block,
+# no lost work). The account genuinely ran out of Groq quota. The tell is
+# the WAIT VALUES once things went bad: 967s, 898s, 1565s, 1233s — all far
+# longer than any TPM window (max 60s), which is the signature of an
+# RPD/TPD (per-DAY) limit, not a per-minute one. By the time Analyst even
+# started, both gpt-oss models were already dead on arrival (429 within
+# milliseconds, no meaningful wait attempted), because Scout's own 12 calls
+# earlier in the SAME run had already spent a chunk of both models' daily
+# budgets — leaving qwen to carry Analyst's 12 calls + Risk's calls alone,
+# and it ran out too.
+#
+# The actual fix has to be fewer real Groq requests per run, not more retry
+# logic — retries and fallback only redistribute load across models with
+# the same combined daily ceiling, they don't create more quota. Batching N
+# matches into a single Analyst (or Risk) call cuts the request count by
+# ~N, which is the only lever inside this file that reduces real API load
+# rather than just handling failures better. (Scout's 12 unbatched calls
+# are the same category of cost and a good next target, but that's a
+# separate file — see scout_agent.py.)
+ANALYST_BATCH_SIZE = int(os.environ.get("ANALYST_BATCH_SIZE", "4"))
+RISK_BATCH_SIZE = int(os.environ.get("RISK_BATCH_SIZE", "4"))
+
+# Empirically, a single match's Analyst output (supporting_stats +
+# confidence_calculation, which can run long when the model has to explain
+# multiple UNKNOWN inputs) has been observed at roughly 400-900 tokens.
+# Budget generously per match and let the batch's total scale with it,
+# rather than reusing a single-match constant that would starve larger
+# batches. The existing truncation-retry path (now driven by
+# truncation_ceiling) is still the backstop if a particular batch runs
+# unusually long — this just sets a first-attempt size that should cover
+# the common case without needing that retry at all.
+ANALYST_TOKENS_PER_MATCH = 900
+ANALYST_TRUNCATION_CEILING = int(os.environ.get("ANALYST_TRUNCATION_CEILING", "12000"))
+
+RISK_TOKENS_PER_MATCH = 350
+RISK_TRUNCATION_CEILING = int(os.environ.get("RISK_TRUNCATION_CEILING", "6000"))
+
+
+def _chunk(items: list, size: int) -> list[list]:
+    return [items[i:i + size] for i in range(0, len(items), max(1, size))]
+
+
 def run_analyst(clean_matches: list[dict]) -> list[dict]:
     probabilities = []
-    for i, match in enumerate(clean_matches):
-        # max_tokens bumped 1500 -> 2000: the ANALYST_PROMPT now also asks
-        # for "supporting_stats" (the real form/H2H/standings figures cited
-        # back) and "confidence_calculation" (the itemized adjustments), so
-        # the expected output is meaningfully longer than before.
-        # This call can raise RuntimeError now (see GROQ_MAX_SINGLE_WAIT_SECONDS
-        # and the fully-exhausted-retry-chain paths in _groq_chat) instead of
-        # blocking forever. Isolate it per-match: a single match that Groq
-        # genuinely can't serve right now (rate-limited across the whole
-        # fallback chain) should cost us that one match, not every match
-        # already collected in `probabilities` earlier in this same loop —
-        # each of those represents real, already-paid-for API calls (and, for
-        # Scout's upstream data, real football-data.org calls too) that would
-        # otherwise be silently thrown away.
+
+    for batch in _chunk(clean_matches, ANALYST_BATCH_SIZE):
+        match_lookup = {m.get("fixture_id"): m for m in batch}
+        max_tokens = min(ANALYST_TOKENS_PER_MATCH * len(batch) + 500, ANALYST_TRUNCATION_CEILING)
+
+        # Same isolation principle as before, just at batch granularity now:
+        # a batch Groq genuinely can't serve right now (rate-limited across
+        # the whole fallback chain) costs us that batch's matches, not every
+        # match already collected in `probabilities` from earlier batches in
+        # this same loop.
         try:
             text = _groq_chat(
-                max_tokens=2000,
+                max_tokens=max_tokens,
+                truncation_ceiling=ANALYST_TRUNCATION_CEILING,
                 messages=[
                     {"role": "system", "content": ANALYST_PROMPT},
                     {
                         "role": "user",
-                        "content": f"""Estimate probabilities for this match:
-{json.dumps(match, indent=2)}
+                        "content": f"""Estimate probabilities for EACH of the following {len(batch)} matches.
+Apply the full ANALYST AGENT instructions above to EVERY match independently
+— each one needs its own supporting_stats and its own itemized
+confidence_calculation, computed only from that match's own data. Do not let
+one match's numbers influence another's.
 
-Return JSON:
+MATCHES:
+{json.dumps(batch, indent=2)}
+
+Return a single JSON object of the form {{"analyses": [ ... ]}} containing
+exactly {len(batch)} elements, ONE PER MATCH ABOVE, in the same order they
+were given. Each element must have this shape:
 {{
   "fixture_id": int,
   "home_team": str,
@@ -966,19 +1032,71 @@ Return JSON:
                 ]
             )
         except RuntimeError as e:
+            names = [f"{m.get('home_team')} vs {m.get('away_team')}" for m in batch]
             logger.error(
-                f"[ANALYST] Giving up on {match.get('home_team')} vs "
-                f"{match.get('away_team')} — Groq unavailable: {e}"
+                f"[ANALYST] Giving up on batch of {len(batch)} matches ({names}) "
+                f"— Groq unavailable: {e}"
             )
             continue
+
         data = _extract_json(text)
-        if data:
-            data.setdefault("fixture_id", match.get("fixture_id"))
-            data.setdefault("home_team", match.get("home_team"))
-            data.setdefault("away_team", match.get("away_team"))
-            data["odds_snapshot"] = match.get("odds_snapshot", {})
-            data["league"] = match.get("league")
-            probabilities.append(data)
+        analyses = data.get("analyses") if isinstance(data, dict) else None
+        if not isinstance(analyses, list) or not analyses:
+            logger.error(
+                f"Analyst batch parse error for {len(batch)} matches "
+                f"(finish_reason={_last_finish_reason}): {text[:300]}"
+            )
+            continue
+
+        # Two-pass mapping. A single forward pass that checks "is exactly
+        # one match unclaimed so far?" undercounts: a later item in this
+        # SAME response hasn't had the chance to claim its own valid
+        # fixture_id yet, so an early garbage item can see more
+        # "unclaimed" matches than will actually remain once the whole
+        # response is processed. Pass 1 here establishes the true final set
+        # of validly-claimed fixture_ids across the whole response before
+        # any recovery attempt; pass 2 only recovers a bad/missing
+        # fixture_id when there's genuinely exactly one leftover match it
+        # could be — and consumes it from the pool so a second bad item in
+        # the same batch can't also claim it.
+        claimed_ids = {
+            item.get("fixture_id") for item in analyses
+            if isinstance(item, dict) and item.get("fixture_id") in match_lookup
+        }
+        unclaimed = [m for m in batch if m.get("fixture_id") not in claimed_ids]
+
+        seen_fixture_ids = set()
+        for item in analyses:
+            if not isinstance(item, dict):
+                continue
+            fixture_id = item.get("fixture_id")
+            match = match_lookup.get(fixture_id)
+            if match is None:
+                # Model returned a fixture_id that doesn't match anything we
+                # sent, or omitted it — recover positionally only if
+                # exactly one genuinely-unclaimed match remains for this
+                # whole batch, since guessing wrong would silently
+                # attribute numbers to the wrong fixture.
+                if len(unclaimed) == 1:
+                    match = unclaimed.pop(0)
+                    fixture_id = match.get("fixture_id")
+                else:
+                    logger.error(
+                        f"[ANALYST] Batch item has unrecognized/missing "
+                        f"fixture_id={fixture_id!r} and {len(unclaimed)} "
+                        f"unclaimed matches remain in this batch of "
+                        f"{len(batch)} — dropping this item rather than "
+                        f"guessing which match it belongs to."
+                    )
+                    continue
+            seen_fixture_ids.add(fixture_id)
+
+            item["fixture_id"] = fixture_id
+            item.setdefault("home_team", match.get("home_team"))
+            item.setdefault("away_team", match.get("away_team"))
+            item["odds_snapshot"] = match.get("odds_snapshot", {})
+            item["league"] = match.get("league")
+            probabilities.append(item)
 
             # Prompt compliance check — the model is instructed to never
             # return an empty confidence_calculation, but instructions
@@ -986,24 +1104,34 @@ Return JSON:
             # Espanyol vs Real Madrid logged model_confidence=0.6 with
             # calc: []). Flag it loudly rather than silently trusting an
             # unexplained confidence value.
-            calc = data.get("confidence_calculation")
+            calc = item.get("confidence_calculation")
             if not calc:
                 logger.warning(
-                    f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
-                    f"returned model_confidence={data.get('model_confidence')} with an "
+                    f"[ANALYST] {item.get('home_team')} vs {item.get('away_team')} "
+                    f"returned model_confidence={item.get('model_confidence')} with an "
                     f"EMPTY confidence_calculation — prompt compliance gap, this "
                     f"confidence value is unexplained and should not be trusted as-is."
                 )
 
             logger.info(
-                f"[ANALYST] {data.get('home_team')} vs {data.get('away_team')} "
-                f"— model_confidence={data.get('model_confidence')} "
-                f"(calc: {data.get('confidence_calculation')})"
+                f"[ANALYST] {item.get('home_team')} vs {item.get('away_team')} "
+                f"— model_confidence={item.get('model_confidence')} "
+                f"(calc: {item.get('confidence_calculation')})"
             )
-        else:
-            logger.error(
-                f"Analyst parse error for {match.get('home_team')} vs {match.get('away_team')} "
-                f"(finish_reason={_last_finish_reason}): {text[:200]}"
+
+        missing = [m for m in batch if m.get("fixture_id") not in seen_fixture_ids]
+        if missing:
+            # Built as a plain list, not inline in the f-string: nesting an
+            # f-string using the same quote character inside another
+            # f-string's expression (PEP 701) only parses on Python 3.12+.
+            # The CI runtime here is 3.11.16 (see the earlier traceback's
+            # /opt/hostedtoolcache/Python/3.11.16/x64/ path), which would
+            # raise SyntaxError on that construct.
+            missing_names = [f"{m.get('home_team')} vs {m.get('away_team')}" for m in missing]
+            logger.warning(
+                f"[ANALYST] Batch returned {len(analyses)} analyses but "
+                f"{len(missing)}/{len(batch)} matches in the batch got no "
+                f"result: {missing_names}"
             )
 
     # Cheap automated check for the exact anchoring pattern observed earlier:
@@ -1032,56 +1160,122 @@ Return JSON:
 
 def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list[dict]:
     safe = []
-    for i, prob in enumerate(probabilities):
-        intel = next((m for m in intelligence if m.get("fixture_id") == prob.get("fixture_id")), {})
-        # NOTE ON max_tokens=900 (was 600): 600 was consistently too tight —
-        # every Risk call in the previous run hit finish_reason="length" on
-        # its FIRST attempt and had to retry at 1200, which costs a full
-        # extra round trip *and* a second _pace_before_call wait on top of
-        # it. 900 covers the observed real output size (flags array +
-        # rejection_reason text) without needing the retry in the common
-        # case, and the truncation-retry path is still there as a backstop
-        # if a particular match's flags list runs long.
-        # Same isolation concern as run_analyst above: a match Groq genuinely
-        # can't serve right now should be dropped from `safe`, not crash the
-        # whole filter pass and lose every match already approved earlier in
-        # this loop.
+    intel_by_fixture = {m.get("fixture_id"): m for m in intelligence}
+
+    for batch in _chunk(probabilities, RISK_BATCH_SIZE):
+        prob_lookup = {p.get("fixture_id"): p for p in batch}
+        max_tokens = min(RISK_TOKENS_PER_MATCH * len(batch) + 300, RISK_TRUNCATION_CEILING)
+
+        payload = [
+            {
+                "fixture_id": prob.get("fixture_id"),
+                "probabilities": prob,
+                "intelligence": intel_by_fixture.get(prob.get("fixture_id"), {}),
+            }
+            for prob in batch
+        ]
+
+        # Same isolation principle as run_analyst: a batch Groq genuinely
+        # can't serve right now costs us that batch's matches, not every
+        # match already approved into `safe` from earlier batches.
         try:
             text = _groq_chat(
-                max_tokens=900,
+                max_tokens=max_tokens,
+                truncation_ceiling=RISK_TRUNCATION_CEILING,
                 messages=[
                     {"role": "system", "content": RISK_PROMPT},
                     {
                         "role": "user",
-                        "content": f"Evaluate risk:\nProbabilities: {json.dumps(prob)}\nIntelligence: {json.dumps(intel)}"
+                        "content": f"""Evaluate risk for EACH of the following {len(batch)} matches
+independently, applying the full RISK AGENT instructions above to every one
+— one match's flags or rejection must never influence another's assessment.
+
+MATCHES:
+{json.dumps(payload, indent=2)}
+
+Return a single JSON object of the form {{"assessments": [ ... ]}} containing
+exactly {len(batch)} elements, ONE PER MATCH ABOVE, in the same order they
+were given. Each element must have this shape:
+{{
+  "fixture_id": int,
+  "approved": bool,
+  "risk_level": "Low|Medium|High",
+  "flags": [str],
+  "rejection_reason": str|null
+}}"""
                     }
                 ]
             )
         except RuntimeError as e:
+            names = [f"{p.get('home_team')} vs {p.get('away_team')}" for p in batch]
             logger.error(
-                f"[RISK] Giving up on {prob.get('home_team')} vs "
-                f"{prob.get('away_team')} — Groq unavailable: {e}"
+                f"[RISK] Giving up on batch of {len(batch)} matches ({names}) "
+                f"— Groq unavailable: {e}"
             )
             continue
-        risk_data = _extract_json(text)
-        if not risk_data:
+
+        data = _extract_json(text)
+        assessments = data.get("assessments") if isinstance(data, dict) else None
+        if not isinstance(assessments, list) or not assessments:
             logger.error(
-                f"Risk parse error for {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"(finish_reason={_last_finish_reason}): {text[:200]}"
+                f"Risk batch parse error for {len(batch)} matches "
+                f"(finish_reason={_last_finish_reason}): {text[:300]}"
             )
-        elif risk_data.get("approved"):
-            prob["risk_assessment"] = risk_data
-            safe.append(prob)
-            logger.info(
-                f"[RISK] Approved: {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"— risk={risk_data.get('risk_level')}"
+            continue
+
+        # Same two-pass mapping as run_analyst above — see the comment
+        # there for why a single forward pass undercounts "unclaimed".
+        claimed_ids = {
+            item.get("fixture_id") for item in assessments
+            if isinstance(item, dict) and item.get("fixture_id") in prob_lookup
+        }
+        unclaimed = [p for p in batch if p.get("fixture_id") not in claimed_ids]
+
+        seen_fixture_ids = set()
+        for item in assessments:
+            if not isinstance(item, dict):
+                continue
+            fixture_id = item.get("fixture_id")
+            prob = prob_lookup.get(fixture_id)
+            if prob is None:
+                if len(unclaimed) == 1:
+                    prob = unclaimed.pop(0)
+                    fixture_id = prob.get("fixture_id")
+                else:
+                    logger.error(
+                        f"[RISK] Batch item has unrecognized/missing "
+                        f"fixture_id={fixture_id!r} and {len(unclaimed)} "
+                        f"unclaimed matches remain in this batch of "
+                        f"{len(batch)} — dropping this item rather than "
+                        f"guessing which match it belongs to."
+                    )
+                    continue
+            seen_fixture_ids.add(fixture_id)
+
+            if item.get("approved"):
+                prob["risk_assessment"] = item
+                safe.append(prob)
+                logger.info(
+                    f"[RISK] Approved: {prob.get('home_team')} vs {prob.get('away_team')} "
+                    f"— risk={item.get('risk_level')}"
+                )
+            else:
+                logger.info(
+                    f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
+                    f"— model_confidence={prob.get('model_confidence')} "
+                    f"— {item.get('rejection_reason')}"
+                )
+
+        missing = [p for p in batch if p.get("fixture_id") not in seen_fixture_ids]
+        if missing:
+            # Same Python-3.11-compatibility fix as run_analyst above.
+            missing_names = [f"{p.get('home_team')} vs {p.get('away_team')}" for p in missing]
+            logger.warning(
+                f"[RISK] Batch returned {len(assessments)} assessments but "
+                f"{len(missing)}/{len(batch)} matches in the batch got no "
+                f"result: {missing_names}"
             )
-        else:
-            logger.info(
-                f"[RISK] Rejected: {prob.get('home_team')} vs {prob.get('away_team')} "
-                f"— model_confidence={prob.get('model_confidence')} "
-                f"— {risk_data.get('rejection_reason')}"
-            )
+
     return safe
 
 
