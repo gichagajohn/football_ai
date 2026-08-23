@@ -264,7 +264,7 @@ MIN_EDGE_MARGIN = float(os.environ.get("MIN_EDGE_MARGIN", "0.03"))
 # is unchanged and unaffected by this — this band only controls how many
 # selections get combined together, not whether any given selection is
 # worth taking.
-COMBINED_ODDS_MIN = float(os.environ.get("COMBINED_ODDS_MIN", "5.0"))
+COMBINED_ODDS_MIN = float(os.environ.get("COMBINED_ODDS_MIN", "0.0"))
 COMBINED_ODDS_MAX = float(os.environ.get("COMBINED_ODDS_MAX", "20.0"))
 COMBINED_ODDS_TARGET = (COMBINED_ODDS_MIN + COMBINED_ODDS_MAX) / 2
 
@@ -397,7 +397,7 @@ combination that's likely to land in range.
 RULES:
 - Selections: 2-5 only
 - Prefer matches where model_confidence is highest
-- If you cannot construct a combination likely to reach {COMBINED_ODDS_MIN:.1f}+, output decision NO_BET
+- If you cannot construct any combination that stays within the acceptable range while each pick maintains real edge over the market, output decision NO_BET
 
 MARKET PREFERENCE (use these exact market keys):
 - double_chance_home / double_chance_away
@@ -420,7 +420,7 @@ home_win, draw, away_win, btts_yes, over25, double_chance_home,
 double_chance_away, draw_no_bet_home, draw_no_bet_away).
 
 Output JSON: {{"selections": [{{"fixture_id": int, "market": str, "rationale": str}}], "portfolio_confidence": float, "rationale": str}}
-If you cannot build a combination likely to reach {COMBINED_ODDS_MIN:.1f}+, output: {{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
+If you cannot build such a combination, output: {{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
 
 AUDITOR_PROMPT = """You are the AUDITOR AGENT for Football Pulse AI.
 Act as the devil's advocate. Your job is to CHALLENGE every selection.
