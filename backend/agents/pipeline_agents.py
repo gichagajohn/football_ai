@@ -191,6 +191,35 @@ GROQ_MAX_LOCAL_RETRIES = 4
 # finish_reason alone. This caps how far we'll bump max_tokens chasing it.
 GROQ_TRUNCATION_RETRY_CEILING = 6000
 
+# Hard ceiling on any SINGLE sleep this module will ever perform for a 429.
+#
+# _retry_after_seconds() trusts Groq's Retry-After header verbatim, with no
+# upper bound. That's fine for an ordinary per-minute (TPM/RPM) wait — those
+# are always <= ~60s since that's the window length — but a real production
+# run hit sleeping 1428.0s (~24 minutes) in a single call, on the LAST model
+# in the fallback chain (qwen/qwen3.6-27b), when it hit a genuinely
+# daily-quota-flavored 429 with nowhere left to fall forward to.
+# _is_daily_limit_error(e) and _switch_to_next_model() correctly identifies
+# "this is a daily quota, not a per-minute one" for models earlier in the
+# chain — but when the LAST model hits it, _switch_to_next_model() returns
+# False (nothing left), so that whole branch's condition short-circuits to
+# False and execution falls through to the plain per-minute retry path
+# below, which blindly obeys whatever Retry-After said. A 24-minute blocking
+# sleep inside a single Python call is long enough to blow through most CI
+# job timeouts outright — and that's exactly what happened: the run was
+# killed mid-sleep ("Error: The operation was canceled"), which is *worse*
+# than simply failing this one call, because it also discards every match
+# already successfully processed earlier in the same loop.
+#
+# Any wait longer than this is treated as "not going to resolve within a
+# time-boxed pipeline run" regardless of which header reported it or why:
+# fall forward to a fresh model immediately if one remains (a working model
+# right now beats waiting out an unknown-length quota), and if none remain,
+# give up on this one call via RuntimeError rather than blocking — the
+# caller (run_analyst / run_risk_filter) is responsible for catching that
+# and skipping just this one item instead of losing the whole batch.
+GROQ_MAX_SINGLE_WAIT_SECONDS = float(os.environ.get("GROQ_MAX_SINGLE_WAIT_SECONDS", "90"))
+
 JSON_RULES = """
 
 IMPORTANT OUTPUT RULES:
@@ -713,6 +742,37 @@ def _groq_chat(
                 attempt = 0
                 continue  # new model, new budget — retry now, no sleep needed
 
+            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
+
+            # Never block this long inside a time-boxed pipeline run — see
+            # GROQ_MAX_SINGLE_WAIT_SECONDS above for the production incident
+            # this guards against (a 1428s/~24min sleep that got the whole
+            # CI job killed). This check runs BEFORE the attempt-count
+            # threshold below on purpose: the dangerous case is a huge wait
+            # on the very FIRST attempt (attempt=1, as happened in
+            # production), which the old attempt-count gate never caught
+            # because it only fell forward after GROQ_MAX_LOCAL_RETRIES had
+            # already been reached.
+            if wait > GROQ_MAX_SINGLE_WAIT_SECONDS:
+                logger.warning(
+                    f"[RATE LIMIT] {model} reports a {wait:.0f}s wait — too long "
+                    f"to block on inside this pipeline"
+                )
+                if _switch_to_next_model():
+                    attempt = 0
+                    continue
+                # No fallback left and the wait is long enough that
+                # sleeping any capped fraction of it would almost certainly
+                # just hit another 429 immediately after — fail this one
+                # call now instead. The caller is expected to catch this
+                # and skip just this item rather than losing everything
+                # already processed in the same run.
+                raise RuntimeError(
+                    f"Groq API: {model} reports a {wait:.0f}s rate-limit wait "
+                    f"with no fallback model remaining in the chain — giving "
+                    f"up on this call rather than blocking the whole run."
+                ) from e
+
             attempt += 1
             if attempt >= GROQ_MAX_LOCAL_RETRIES:
                 # Exhausted local retries on this model for a per-minute
@@ -734,7 +794,6 @@ def _groq_chat(
                     f"models remain in the chain."
                 ) from e
 
-            wait = _retry_after_seconds(e) or (2 ** attempt) * 5
             logger.warning(
                 f"[RATE LIMIT] Groq 429 on {model} "
                 f"(attempt {attempt}/{GROQ_MAX_LOCAL_RETRIES}) — sleeping {wait:.1f}s"
@@ -840,13 +899,23 @@ def run_analyst(clean_matches: list[dict]) -> list[dict]:
         # for "supporting_stats" (the real form/H2H/standings figures cited
         # back) and "confidence_calculation" (the itemized adjustments), so
         # the expected output is meaningfully longer than before.
-        text = _groq_chat(
-            max_tokens=2000,
-            messages=[
-                {"role": "system", "content": ANALYST_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"""Estimate probabilities for this match:
+        # This call can raise RuntimeError now (see GROQ_MAX_SINGLE_WAIT_SECONDS
+        # and the fully-exhausted-retry-chain paths in _groq_chat) instead of
+        # blocking forever. Isolate it per-match: a single match that Groq
+        # genuinely can't serve right now (rate-limited across the whole
+        # fallback chain) should cost us that one match, not every match
+        # already collected in `probabilities` earlier in this same loop —
+        # each of those represents real, already-paid-for API calls (and, for
+        # Scout's upstream data, real football-data.org calls too) that would
+        # otherwise be silently thrown away.
+        try:
+            text = _groq_chat(
+                max_tokens=2000,
+                messages=[
+                    {"role": "system", "content": ANALYST_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"""Estimate probabilities for this match:
 {json.dumps(match, indent=2)}
 
 Return JSON:
@@ -878,9 +947,15 @@ Return JSON:
   "confidence_calculation": [str],
   "model_confidence": float
 }}"""
-                }
-            ]
-        )
+                    }
+                ]
+            )
+        except RuntimeError as e:
+            logger.error(
+                f"[ANALYST] Giving up on {match.get('home_team')} vs "
+                f"{match.get('away_team')} — Groq unavailable: {e}"
+            )
+            continue
         data = _extract_json(text)
         if data:
             data.setdefault("fixture_id", match.get("fixture_id"))
@@ -952,16 +1027,27 @@ def run_risk_filter(probabilities: list[dict], intelligence: list[dict]) -> list
         # rejection_reason text) without needing the retry in the common
         # case, and the truncation-retry path is still there as a backstop
         # if a particular match's flags list runs long.
-        text = _groq_chat(
-            max_tokens=900,
-            messages=[
-                {"role": "system", "content": RISK_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"Evaluate risk:\nProbabilities: {json.dumps(prob)}\nIntelligence: {json.dumps(intel)}"
-                }
-            ]
-        )
+        # Same isolation concern as run_analyst above: a match Groq genuinely
+        # can't serve right now should be dropped from `safe`, not crash the
+        # whole filter pass and lose every match already approved earlier in
+        # this loop.
+        try:
+            text = _groq_chat(
+                max_tokens=900,
+                messages=[
+                    {"role": "system", "content": RISK_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"Evaluate risk:\nProbabilities: {json.dumps(prob)}\nIntelligence: {json.dumps(intel)}"
+                    }
+                ]
+            )
+        except RuntimeError as e:
+            logger.error(
+                f"[RISK] Giving up on {prob.get('home_team')} vs "
+                f"{prob.get('away_team')} — Groq unavailable: {e}"
+            )
+            continue
         risk_data = _extract_json(text)
         if not risk_data:
             logger.error(
@@ -1010,17 +1096,27 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     # selections), while the existing truncation retry still climbs to the
     # 6000 ceiling if a particular candidate set needs it. (This budget is
     # irrelevant for qwen now that it runs in "none"/non-thinking mode.)
-    text = _groq_chat(
-        max_tokens=4000,
-        reasoning_effort="default",
-        messages=[
-            {"role": "system", "content": PORTFOLIO_PROMPT},
-            {
-                "role": "user",
-                "content": f"Select matches and markets from these safe candidates:\n{json.dumps(safe_matches, indent=2)}"
-            }
-        ]
-    )
+    try:
+        text = _groq_chat(
+            max_tokens=4000,
+            reasoning_effort="default",
+            messages=[
+                {"role": "system", "content": PORTFOLIO_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Select matches and markets from these safe candidates:\n{json.dumps(safe_matches, indent=2)}"
+                }
+            ]
+        )
+    except RuntimeError as e:
+        # Groq genuinely unavailable (rate-limited across the whole fallback
+        # chain, with a wait too long to block on — see
+        # GROQ_MAX_SINGLE_WAIT_SECONDS). Degrade to NO_BET, same as every
+        # other failure mode here, instead of letting this crash the whole
+        # daily_run and lose the Scout/Analyst/Risk work that already
+        # succeeded upstream in this same run.
+        logger.error(f"Portfolio agent unavailable: {e}")
+        return {"decision": "NO_BET", "reason": f"Portfolio agent unavailable: {e}"}
     data = _extract_json(text)
     if not data:
         logger.error(
@@ -1126,16 +1222,20 @@ def run_auditor(portfolio: dict) -> dict:
     if portfolio.get("decision") == "NO_BET":
         return {"auditor_verdict": "REJECT", "critical_flags": ["No portfolio to audit — already NO_BET."]}
 
-    text = _groq_chat(
-        max_tokens=1500,
-        messages=[
-            {"role": "system", "content": AUDITOR_PROMPT},
-            {
-                "role": "user",
-                "content": f"Challenge this ticket:\n{json.dumps(portfolio, indent=2)}"
-            }
-        ]
-    )
+    try:
+        text = _groq_chat(
+            max_tokens=1500,
+            messages=[
+                {"role": "system", "content": AUDITOR_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Challenge this ticket:\n{json.dumps(portfolio, indent=2)}"
+                }
+            ]
+        )
+    except RuntimeError as e:
+        logger.error(f"Auditor agent unavailable: {e}")
+        return {"auditor_verdict": "REJECT", "critical_flags": [f"Auditor agent unavailable: {e}"]}
     data = _extract_json(text)
     if not data:
         logger.error(f"Auditor parse error (finish_reason={_last_finish_reason}): {text[:200]}")
@@ -1150,16 +1250,20 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
     if audited.get("auditor_verdict") == "REJECT":
         return {"decision": "NO_BET", "reason": f"Auditor rejected: {audited.get('critical_flags')}", "final_confidence": 0.0}
 
-    text = _groq_chat(
-        max_tokens=400,
-        messages=[
-            {"role": "system", "content": DECISION_PROMPT},
-            {
-                "role": "user",
-                "content": f"Portfolio: {json.dumps(portfolio)}\nAudit: {json.dumps(audited)}\nMake the final decision."
-            }
-        ]
-    )
+    try:
+        text = _groq_chat(
+            max_tokens=400,
+            messages=[
+                {"role": "system", "content": DECISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Portfolio: {json.dumps(portfolio)}\nAudit: {json.dumps(audited)}\nMake the final decision."
+                }
+            ]
+        )
+    except RuntimeError as e:
+        logger.error(f"Decision agent unavailable: {e}")
+        return {"decision": "NO_BET", "reason": f"Decision agent unavailable: {e}", "final_confidence": 0.0}
     data = _extract_json(text)
     if not data:
         logger.error(f"Decision parse error (finish_reason={_last_finish_reason}): {text[:200]}")
@@ -1214,17 +1318,44 @@ the {CONFIDENCE_THRESHOLD * 100:.0f}%+ confidence threshold today.
 Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
-    return _groq_chat(
-        max_tokens=1200,
-        messages=[
-            {"role": "system", "content": PUBLISHER_PROMPT},
-            {
-                "role": "user",
-                "content": f"""Format the final ticket.
+    try:
+        return _groq_chat(
+            max_tokens=1200,
+            messages=[
+                {"role": "system", "content": PUBLISHER_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"""Format the final ticket.
 Date: {target_date}
 Portfolio: {json.dumps(portfolio)}
 Decision: {json.dumps(decision)}
 Audited: {json.dumps(audited)}"""
-            }
-        ]
-    )
+                }
+            ]
+        )
+    except RuntimeError as e:
+        # This is the very last step after every upstream agent has already
+        # succeeded — a Publisher-only failure here shouldn't mean no email
+        # goes out at all. Fall back to a plain-text summary built directly
+        # from the data we already have, skipping only the LLM formatting.
+        logger.error(f"Publisher agent unavailable: {e}")
+        selections_text = "\n".join(
+            f"MATCH: {s.get('home_team')} vs {s.get('away_team')} ({s.get('league')})\n"
+            f"Market: {s.get('market')}\nOdds: {s.get('odds')}\nReason: {s.get('rationale', '')}"
+            for s in portfolio.get("selections", [])
+        )
+        return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔵 FOOTBALL PULSE AI
+📅 {target_date}  |  🕗 08:00 EAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Confidence: {decision.get('final_confidence', 'N/A')}
+⚠️  Overall Risk: {portfolio.get('risk_level', 'N/A')}
+(Publisher agent unavailable — this is a plain fallback summary, not the
+usual formatted ticket: {e})
+
+{selections_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 Combined Odds: {portfolio.get('combined_odds', 'N/A')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
