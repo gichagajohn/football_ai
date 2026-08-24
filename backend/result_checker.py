@@ -7,13 +7,19 @@ selection win/loss/void based on the actual final score, then updates
 the ticket's overall outcome.
 
 This is what feeds the Memory Agent's weekly performance report, and
-(as of Phase 2) also stores the final score so the website's Results
-page can display real scorelines instead of just win/loss.
+stores the final score so the website's Results page can display real
+scorelines instead of just win/loss.
+
+Provider: football-data.org (v4) — the SAME provider the Scout agent
+already uses. (The previous API-Football / api-sports.io provider was
+returning 403, so the result checker switched to the key we already
+have and pay nothing extra for.)
 """
 
 import logging
 import os
-from datetime import date, timedelta
+import time
+from datetime import date
 
 import httpx
 
@@ -21,31 +27,103 @@ from backend.db import supabase_client
 
 logger = logging.getLogger(__name__)
 
-API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
+FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
+
+# Match statuses that mean the match is over and the score is final.
+_FINAL_STATUSES = {"FINISHED", "AWARDED"}
+
+# ── rate limiting / retries (mirrors scout_agent discipline) ──
+FOOTBALL_DATA_MIN_INTERVAL_SECONDS = 6.5
+FOOTBALL_DATA_MAX_RETRIES = 2
+FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS = 30.0
+
+_last_request_time = 0.0
+
+
+def _throttle() -> None:
+    """Respect a minimum interval between football-data.org calls."""
+    global _last_request_time
+    now = time.monotonic()
+    wait = FOOTBALL_DATA_MIN_INTERVAL_SECONDS - (now - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_time = time.monotonic()
+
+
+def _fd_get(url: str) -> httpx.Response:
+    """GET with throttle + retry on 429/5xx. Raises on persistent failure."""
+    global _last_request_time
+    for attempt in range(FOOTBALL_DATA_MAX_RETRIES + 1):
+        _throttle()
+        try:
+            resp = httpx.get(
+                url,
+                headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
+                timeout=20,
+            )
+        except httpx.HTTPError as e:
+            logger.warning(f"[RESULT_CHECK] football-data.org request failed ({url}): {e}")
+            if attempt >= FOOTBALL_DATA_MAX_RETRIES:
+                raise
+            time.sleep(FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS)
+            continue
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else FOOTBALL_DATA_DEFAULT_RETRY_WAIT_SECONDS
+            logger.warning(
+                f"[RESULT_CHECK] football-data.org 429 on {url} "
+                f"(attempt {attempt + 1}/{FOOTBALL_DATA_MAX_RETRIES}) — retrying in {wait:.0f}s"
+            )
+            if attempt >= FOOTBALL_DATA_MAX_RETRIES:
+                resp.raise_for_status()
+            time.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    raise RuntimeError(f"Exhausted retries for {url}")
 
 
 def fetch_result(fixture_id: int) -> dict | None:
-    """Fetch the final result for a fixture. Returns None if not finished yet."""
-    try:
-        resp = httpx.get(
-            "https://v3.football.api-sports.io/fixtures",
-            headers={"x-apisports-key": API_FOOTBALL_KEY},
-            params={"id": fixture_id},
-            timeout=15,
+    """Fetch the final result for a football-data.org match id.
+
+    Returns None if the match isn't finished yet (so the selection stays
+    pending for a later run). Returns a dict with home_goals, away_goals,
+    and status on success.
+    """
+    if not FOOTBALL_DATA_KEY:
+        logger.warning(
+            "[RESULT_CHECK] FOOTBALL_DATA_KEY is not set — cannot check results. "
+            "Set it in the environment (same key the Scout agent uses)."
         )
-        resp.raise_for_status()
-        data = resp.json().get("response", [])
+        return None
+
+    try:
+        resp = _fd_get(f"{FOOTBALL_DATA_BASE}/matches/{fixture_id}")
+        data = resp.json().get("match")
         if not data:
             return None
 
-        fixture = data[0]
-        status = fixture["fixture"]["status"]["short"]
-        if status not in ("FT", "AET", "PEN"):  # Full Time, After Extra Time, Penalties
+        status = data.get("status")
+        if status not in _FINAL_STATUSES:
+            return None
+
+        score = data.get("score") or {}
+        # football-data.org: fullTime = score at 90 minutes (the standard
+        # settlement basis for 1X2 / totals markets).
+        full_time = score.get("fullTime") or {}
+        home_goals = full_time.get("home")
+        away_goals = full_time.get("away")
+        if home_goals is None or away_goals is None:
+            logger.warning(f"[RESULT_CHECK] Match {fixture_id} finished but has no full-time score.")
             return None
 
         return {
-            "home_goals": fixture["goals"]["home"],
-            "away_goals": fixture["goals"]["away"],
+            "home_goals": int(home_goals),
+            "away_goals": int(away_goals),
             "status": status,
         }
     except Exception as e:
