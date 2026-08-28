@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import date
 
 import httpx
@@ -56,193 +57,163 @@ FPL_NAME_ALIASES = {
 }
 
 TEAM_HOME_CITY: dict[str, str] = {
-    "arsenal": "London",
-    "chelsea": "London",
-    "tottenham": "London",
-    "spurs": "London",
-    "west ham": "London",
-    "crystal palace": "London",
-    "fulham": "London",
-    "brentford": "London",
-    "wimbledon": "London",
-    "charlton": "London",
-    "millwall": "London",
-    "manchester city": "Manchester",
-    "manchester united": "Manchester",
-    "liverpool": "Liverpool",
-    "everton": "Liverpool",
-    "newcastle": "Newcastle upon Tyne",
-    "sunderland": "Sunderland",
-    "aston villa": "Birmingham",
-    "birmingham": "Birmingham",
-    "wolverhampton": "Wolverhampton",
-    "wolves": "Wolverhampton",
-    "west bromwich": "West Bromwich",
-    "leicester": "Leicester",
-    "nottingham": "Nottingham",
-    "derby": "Derby",
-    "sheffield united": "Sheffield",
-    "sheffield wednesday": "Sheffield",
-    "leeds": "Leeds",
-    "burnley": "Burnley",
-    "bolton": "Bolton",
-    "blackburn": "Blackburn",
-    "brighton": "Brighton",
-    "southampton": "Southampton",
-    "portsmouth": "Portsmouth",
-    "watford": "Watford",
-    "luton": "Luton",
-    "norwich": "Norwich",
-    "ipswich": "Ipswich",
-    "coventry": "Coventry",
-    "stoke": "Stoke-on-Trent",
-    "middlesbrough": "Middlesbrough",
-    "swansea": "Swansea",
-    "cardiff": "Cardiff",
-    "real madrid": "Madrid",
-    "atletico madrid": "Madrid",
-    "atletico de madrid": "Madrid",
-    "getafe": "Madrid",
-    "rayo vallecano": "Madrid",
-    "barcelona": "Barcelona",
-    "espanyol": "Barcelona",
-    "valencia": "Valencia",
-    "villarreal": "Villarreal",
-    "sevilla": "Seville",
-    "real betis": "Seville",
-    "athletic bilbao": "Bilbao",
-    "athletic club": "Bilbao",
-    "real sociedad": "San Sebastian",
-    "osasuna": "Pamplona",
-    "deportivo alaves": "Vitoria-Gasteiz",
-    "alaves": "Vitoria-Gasteiz",
-    "celta vigo": "Vigo",
-    "malaga": "Malaga",
-    "granada": "Granada",
-    "real valladolid": "Valladolid",
-    "cadiz": "Cadiz",
-    "almeria": "Almeria",
-    "girona": "Girona",
-    "las palmas": "Las Palmas",
-    "leganes": "Leganes",
-    "bayern munich": "Munich",
-    "fc bayern": "Munich",
-    "borussia dortmund": "Dortmund",
-    "bvb": "Dortmund",
-    "rb leipzig": "Leipzig",
+    # England
+    "arsenal": "London", "chelsea": "London", "tottenham": "London", "spurs": "London",
+    "west ham": "London", "crystal palace": "London", "fulham": "London",
+    "brentford": "London", "wimbledon": "London", "charlton": "London",
+    "millwall": "London", "qpr": "London", "leyton orient": "London",
+    "manchester city": "Manchester", "manchester united": "Manchester",
+    "liverpool": "Liverpool", "everton": "Liverpool",
+    "newcastle": "Newcastle upon Tyne", "newcastle united": "Newcastle upon Tyne",
+    "sunderland": "Sunderland", "middlesbrough": "Middlesbrough",
+    "aston villa": "Birmingham", "birmingham": "Birmingham", "west bromwich": "West Bromwich",
+    "wolves": "Wolverhampton", "wolverhampton": "Wolverhampton",
+    "leicester": "Leicester", "nottingham": "Nottingham", "derby": "Derby",
+    "sheffield united": "Sheffield", "sheffield wednesday": "Sheffield",
+    "leeds": "Leeds", "burnley": "Burnley", "bolton": "Bolton",
+    "blackburn": "Blackburn", "brighton": "Brighton", "southampton": "Southampton",
+    "portsmouth": "Portsmouth", "watford": "Watford", "luton": "Luton",
+    "norwich": "Norwich", "ipswich": "Ipswich", "coventry": "Coventry",
+    "stoke": "Stoke-on-Trent", "swansea": "Swansea", "cardiff": "Cardiff",
+    "bournemouth": "Bournemouth", "bristol city": "Bristol", "plymouth": "Plymouth",
+    # Spain
+    "real madrid": "Madrid", "atletico madrid": "Madrid", "atletico de madrid": "Madrid",
+    "getafe": "Madrid", "rayo vallecano": "Madrid", "barcelona": "Barcelona",
+    "espanyol": "Barcelona", "valencia": "Valencia", "villarreal": "Villarreal",
+    "sevilla": "Seville", "real betis": "Seville", "athletic bilbao": "Bilbao",
+    "athletic club": "Bilbao", "real sociedad": "San Sebastian", "osasuna": "Pamplona",
+    "deportivo alaves": "Vitoria-Gasteiz", "alaves": "Vitoria-Gasteiz",
+    "celta vigo": "Vigo", "malaga": "Malaga", "granada": "Granada",
+    "real valladolid": "Valladolid", "cadiz": "Cadiz", "almeria": "Almeria",
+    "girona": "Girona", "las palmas": "Las Palmas", "leganes": "Leganes",
+    "elche": "Elche", "racing": "Santander", "racing santander": "Santander",
+    "real sociedad de futbol": "San Sebastian", "deportivo": "La Coruna",
+    # Germany (Bundesliga 2025/26 - promoted + relegated)
+    "bayern munich": "Munich", "fc bayern": "Munich", "fc bayern munchen": "Munich",
+    "borussia dortmund": "Dortmund", "bvb": "Dortmund", "rb leipzig": "Leipzig",
     "bayer leverkusen": "Leverkusen",
-    "borussia monchengladbach": "Monchengladbach",
-    "eintracht frankfurt": "Frankfurt",
-    "sc freiburg": "Freiburg",
-    "vfb stuttgart": "Stuttgart",
-    "stuttgar": "Stuttgart",
-    "wolfsburg": "Wolfsburg",
-    "werder bremen": "Bremen",
-    "hamburger": "Hamburg",
-    "hertha berlin": "Berlin",
-    "union berlin": "Berlin",
-    "schalke": "Gelsenkirchen",
-    "augsburg": "Augsburg",
-    "mainz": "Mainz",
-    "hoffenheim": "Sinsheim",
-    "koln": "Cologne",
-    "fc koln": "Cologne",
-    "cologne": "Cologne",
-    "heidenheim": "Heidenheim",
-    "darmstadt": "Darmstadt",
-    "juventus": "Turin",
-    "torino": "Turin",
-    "ac milan": "Milan",
-    "inter milan": "Milan",
-    "internazionale": "Milan",
-    "como": "Como",
-    "as roma": "Rome",
-    "lazio": "Rome",
-    "napoli": "Naples",
-    "atalanta": "Bergamo",
-    "fiorentina": "Florence",
-    "bologna": "Bologna",
-    "genoa": "Genoa",
-    "sampdoria": "Genoa",
-    "udinese": "Udine",
-    "cagliari": "Cagliari",
-    "sassuolo": "Sassuolo",
-    "empoli": "Empoli",
-    "lecce": "Lecce",
-    "frosinone": "Frosinone",
-    "monza": "Monza",
-    "hellas verona": "Verona",
-    "venezia": "Venice",
-    "parma": "Parma",
-    "psg": "Paris",
-    "paris saint-germain": "Paris",
-    "paris saint germain": "Paris",
-    "olympique de marseille": "Marseille",
-    "marseille": "Marseille",
-    "olympique lyonnais": "Lyon",
-    "lyon": "Lyon",
-    "monaco": "Monaco",
-    "nice": "Nice",
-    "stade rennais": "Rennes",
-    "rennes": "Rennes",
-    "lille": "Lille",
-    "montpellier": "Montpellier",
-    "nantes": "Nantes",
-    "strasbourg": "Strasbourg",
-    "toulouse": "Toulouse",
-    "reims": "Reims",
-    "lens": "Lens",
-    "brest": "Brest",
-    "auxerre": "Auxerre",
-    "angers": "Angers",
-    "le havre": "Le Havre",
-    "clermont": "Clermont-Ferrand",
-    "metz": "Metz",
-    "lorient": "Lorient",
-    "saint-etienne": "Saint-Etienne",
-    "ajax": "Amsterdam",
-    "psv": "Eindhoven",
-    "feyenoord": "Rotterdam",
-    "az alkmaar": "Alkmaar",
-    "az": "Alkmaar",
-    "vitesse": "Arnhem",
-    "utrecht": "Utrecht",
-    "twente": "Enschede",
-    "benfica": "Lisbon",
-    "sporting cp": "Lisbon",
-    "porto": "Porto",
-    "braga": "Braga",
-    "vitoria guimaraes": "Guimaraes",
-    "united states": "New York",
-    "usa": "New York",
-    "mexico": "Mexico City",
-    "canada": "Toronto",
-    "brazil": "Rio de Janeiro",
-    "argentina": "Buenos Aires",
-    "germany": "Berlin",
-    "france": "Paris",
-    "england": "London",
-    "spain": "Madrid",
-    "italy": "Rome",
-    "portugal": "Lisbon",
-    "netherlands": "Amsterdam",
-    "belgium": "Brussels",
-    "morocco": "Casablanca",
-    "senegal": "Dakar",
-    "nigeria": "Lagos",
-    "egypt": "Cairo",
-    "japan": "Tokyo",
-    "south korea": "Seoul",
-    "australia": "Sydney",
+    "borussia monchengladbach": "Monchengladbach", "gladbach": "Monchengladbach",
+    "eintracht frankfurt": "Frankfurt", "sc freiburg": "Freiburg",
+    "vfb stuttgart": "Stuttgart", "stuttgart": "Stuttgart",
+    "vfl wolfsburg": "Wolfsburg", "wolfsburg": "Wolfsburg",
+    "werder bremen": "Bremen", "hamburger sv": "Hamburg", "hamburg": "Hamburg",
+    "hertha berlin": "Berlin", "union berlin": "Berlin",
+    "fc schalke 04": "Gelsenkirchen", "schalke": "Gelsenkirchen",
+    "fc augsburg": "Augsburg", "augsburg": "Augsburg",
+    "mainz 05": "Mainz", "fsv mainz": "Mainz", "mainz": "Mainz",
+    "tsg 1899 hoffenheim": "Sinsheim", "hoffenheim": "Sinsheim",
+    "1 fc koln": "Cologne", "fc koln": "Cologne", "koln": "Cologne",
+    "1 fc heidenheim": "Heidenheim", "heidenheim": "Heidenheim",
+    "sv darmstadt 98": "Darmstadt", "darmstadt": "Darmstadt",
+    "1 fc kaiserslautern": "Kaiserslautern", "kaiserslautern": "Kaiserslautern",
+    "1 fc magdeburg": "Magdeburg", "magdeburg": "Magdeburg",
+    "1 fc nurnberg": "Nuremberg", "nurnberg": "Nuremberg",
+    "fc schalke": "Gelsenkirchen",
+    # Italy (Serie A 2025/26)
+    "juventus": "Turin", "torino": "Turin", "ac milan": "Milan",
+    "inter milan": "Milan", "internazionale": "Milan", "fc internazionale": "Milan",
+    "como 1907": "Como", "como": "Como",
+    "as roma": "Rome", "ss lazio": "Rome", "lazio": "Rome",
+    "napoli": "Naples", "ssc napoli": "Naples",
+    "atalanta": "Bergamo", "atalanta bc": "Bergamo",
+    "acf fiorentina": "Florence", "fiorentina": "Florence",
+    "bologna": "Bologna", "bologna fc": "Bologna",
+    "genoa": "Genoa", "sampdoria": "Genoa",
+    "udinese": "Udine", "cagliari": "Cagliari",
+    "sassuolo": "Sassuolo", "us sassuolo": "Sassuolo",
+    "empoli": "Empoli", "lecce": "Lecce", "frosinone": "Frosinone",
+    "monza": "Monza", "hellas verona": "Verona", "verona": "Verona",
+    "venezia": "Venice", "parma": "Parma", "palermo": "Palermo",
+    "brescia": "Brescia", "cremonese": "Cremona", "spezia": "La Spezia",
+    "ternana": "Terni", "reggina": "Reggio Calabria",
+    # France
+    "psg": "Paris", "paris saint-germain": "Paris", "paris saint germain": "Paris",
+    "olympique de marseille": "Marseille", "om": "Marseille", "marseille": "Marseille",
+    "olympique lyonnais": "Lyon", "ol": "Lyon", "lyon": "Lyon",
+    "as monaco": "Monaco", "monaco": "Monaco",
+    "ogc nice": "Nice", "nice": "Nice",
+    "stade rennais": "Rennes", "rennes": "Rennes",
+    "losc lille": "Lille", "lille": "Lille",
+    "montpellier": "Montpellier", "fc nantes": "Nantes", "nantes": "Nantes",
+    "rc strasbourg": "Strasbourg", "strasbourg": "Strasbourg",
+    "toulouse fc": "Toulouse", "toulouse": "Toulouse",
+    "stade de reims": "Reims", "reims": "Reims",
+    "rc lens": "Lens", "lens": "Lens", "stade brestois": "Brest", "brest": "Brest",
+    "aj auxerre": "Auxerre", "auxerre": "Auxerre",
+    "angers sco": "Angers", "angers": "Angers",
+    "le havre ac": "Le Havre", "le havre": "Le Havre",
+    "clermont foot": "Clermont-Ferrand", "clermont": "Clermont-Ferrand",
+    "fc metz": "Metz", "metz": "Metz",
+    "fc lorient": "Lorient", "lorient": "Lorient",
+    "as saint-etienne": "Saint-Etienne", "saint-etienne": "Saint-Etienne",
+    "fc nantes": "Nantes",
+    # Netherlands / Portugal
+    "ajax": "Amsterdam", "psv eindhoven": "Eindhoven", "psv": "Eindhoven",
+    "feyenoord": "Rotterdam", "az alkmaar": "Alkmaar", "az": "Alkmaar",
+    "vitesse": "Arnhem", "fc utrecht": "Utrecht", "utrecht": "Utrecht",
+    "fc twente": "Enschede", "twente": "Enschede",
+    "sl benfica": "Lisbon", "benfica": "Lisbon", "sporting cp": "Lisbon",
+    "sporting clube de portugal": "Lisbon",
+    "fc porto": "Porto", "porto": "Porto",
+    "sc braga": "Braga", "braga": "Braga",
+    "vitoria sc": "Guimaraes", "vitoria guimaraes": "Guimaraes",
+    "rio ave fc": "Vila do Conde", "rio ave": "Vila do Conde",
+    "gil vicente fc": "Barcelos", "gil vicente": "Barcelos",
+    # Countries (fallback)
+    "united states": "New York", "usa": "New York", "mexico": "Mexico City",
+    "canada": "Toronto", "brazil": "Rio de Janeiro", "argentina": "Buenos Aires",
+    "germany": "Berlin", "france": "Paris", "england": "London",
+    "spain": "Madrid", "italy": "Rome", "portugal": "Lisbon",
+    "netherlands": "Amsterdam", "belgium": "Brussels", "morocco": "Casablanca",
+    "senegal": "Dakar", "nigeria": "Lagos", "egypt": "Cairo",
+    "japan": "Tokyo", "south korea": "Seoul", "australia": "Sydney",
 }
 
 
+
+def _strip_accents(text: str) -> str:
+    """Lowercase + strip diacritics so 'Alavés' matches 'alaves'."""
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text.lower())
+        if not unicodedata.combining(c)
+    )
+
+
+def _normalize_team_name_for_lookup(name: str) -> str:
+    """Strip common club-name noise so the TEAM_HOME_CITY keys match."""
+    s = _strip_accents(name)
+    # common suffixes and qualifiers
+    for suffix in (
+        " fc", " cf", " afc", " ssc", " ssc ", " sc", " bc", " sv",
+        " ac", " acf", " as", " ogc", " losc", " rc ", " stade",
+        " olympique", " club", " deportivo", " sporting",
+    ):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    return s
+
+
 def _get_venue_city(home_team_name: str) -> str | None:
+    """Look up a team's home city. Tries:
+    1) exact lower match,
+    2) diacritic-stripped match,
+    3) normalised suffix-stripped match,
+    4) substring containment (either direction).
+    Returns the city string, or None if no match."""
+    if not home_team_name:
+        return None
     name_lower = home_team_name.lower().strip()
     if name_lower in TEAM_HOME_CITY:
         return TEAM_HOME_CITY[name_lower]
+    name_norm = _normalize_team_name_for_lookup(home_team_name)
+    if name_norm in TEAM_HOME_CITY:
+        return TEAM_HOME_CITY[name_norm]
     for key, city in TEAM_HOME_CITY.items():
         if key in name_lower or name_lower in key:
+            return city
+        key_norm = _normalize_team_name_for_lookup(key)
+        if key_norm in name_norm or name_norm in key_norm:
             return city
     return None
 
@@ -394,20 +365,60 @@ async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dic
 
 
 async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
+    """Fetch team's recent form (W/L/D string).
+
+    Bug fix (Phase 2): original version queried with `limit=5` and had
+    no cross-season fallback. Early in the season (matchdays 1-2) teams
+    have only 1-2 FINISHED matches, so the form string was just 'W' or 'L'
+    and the Analyst flagged 'limited recent form data'. Newly-promoted
+    teams have zero. Now: query current season with limit=10; if fewer
+    than 3 results come back, fall back to the previous season.
+    """
+    matches: list = []
     try:
         data = await _fd_get(
             http,
             f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
-            params={"status": "FINISHED", "limit": 5},
+            params={"status": "FINISHED", "limit": 10},
         )
+        matches = list(data.get("matches") or [])
     except Exception as e:
         logger.warning(f"[SCOUT] Recent-form fetch failed for team {team_id}: {e}")
+        return {}
+
+    if len(matches) < 3:
+        try:
+            from datetime import date as _d
+            last_season = _d.today().year - 1
+            data2 = await _fd_get(
+                http,
+                f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
+                params={"status": "FINISHED", "limit": 10, "season": last_season},
+            )
+            extra = list(data2.get("matches") or [])
+            seen = {m.get("id") for m in matches}
+            added = 0
+            for mm in extra:
+                if mm.get("id") not in seen:
+                    matches.append(mm)
+                    seen.add(mm.get("id"))
+                    added += 1
+            if added:
+                logger.info(
+                    f"[SCOUT] Form fallback for team {team_id}: added "
+                    f"{added} matches from season {last_season} "
+                    f"(had {len(matches) - added} from current season)."
+                )
+        except Exception as e:
+            logger.warning(f"[SCOUT] Form season-fallback failed for team {team_id}: {e}")
+
+    if not matches:
         return {}
 
     results = []
     goals_for = 0
     goals_against = 0
-    for m in data.get("matches", [])[:5]:
+    for m in matches[:5]:
         full_time = m.get("score", {}).get("fullTime", {})
         home_goals, away_goals = full_time.get("home"), full_time.get("away")
         if home_goals is None or away_goals is None:
@@ -495,25 +506,173 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
             return []
 
 
+def _strip_accents(text: str) -> str:
+    """Lowercase + strip diacritics (München -> munchen)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text.lower())
+        if not unicodedata.combining(c)
+    )
+
+
 def _normalize_team_name(name: str) -> str:
-    name = name.strip()
-    for suffix in (" FC", " CF", " AFC", " CD", " SD", " AC"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-    name = name.replace("&", "and")
-    name = re.sub(r"\s+", " ", name)
-    return name.strip().lower()
+    """Normalise team names for cross-provider matching.
+
+    Bug fix (Phase 2): the original only stripped trailing suffixes and
+    never stripped diacritics, so 'FC Bayern München' (football-data.org)
+    never matched 'Bayern Munich' (The Odds API) in _find_match_odds.
+    Bayern's odds then silently fell into the 'without odds' bucket
+    (only 4/6 fixtures got odds on matchday 1). Fix: strip diacritics and
+    leading prefixes like 'FC ', 'SSC ', 'US ', 'AS ', 'AC ' that football-
+    data.org includes but The Odds API omits.
+    """
+    s = _strip_accents(name.strip())
+    for prefix in (
+        "fc ", "sc ", "ssc ", "us ", "as ", "ac ", "afc ", "bc ", "cf ", "sv ",
+        "vfb ", "vfl ", "fsv ", "tsg ", "1. fc ", "if ", "fk ", "ik ", "bk ",
+        "ogc ", "losc ", "rc ", "og ", "acf ", "ud ", "cd ", "sd ",
+        "internazionale ",
+    ):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+    for suffix in (
+        " fc", " cf", " afc", " cd", " sd", " ac", " bc", " sc", " as",
+        " acf", " fcc", " ogc", " afc", " olympique", " club",
+        " deportivo", " sporting",
+    ):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    s = s.replace("&", "and")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+# Aliases for known football-data.org <-> The Odds API name mismatches.
+# After both sides are diacritic/prefix-stripped via _normalize_team_name,
+# these canonical names are compared. Add an entry when you spot a new
+# real-world provider naming mismatch; do NOT add broad fuzzy matching
+# (Levenshtein / token-overlap) - the simple substring match below is
+# intentional and kept simple to avoid false positives (e.g. "milan"
+# inside "inter milan").
+_TEAM_NAME_ALIASES = {
+    # Bundesliga 2025/26 - promoted/relegated
+    "kaiserslautern": "1 fc kaiserslautern",
+    "magdeburg": "1 fc magdeburg",
+    "nurnberg": "1 fc nurnberg",
+    "darmstadt": "sv darmstadt 98",
+    "heidenheim": "1 fc heidenheim",
+    "hamburg": "hamburger sv",
+    # Bundesliga vs Odds API naming differences
+    "bayern munich": "fc bayern munchen",
+    "fc bayern munchen": "fc bayern munchen",
+    "bayer leverkusen": "bayer 04 leverkusen",
+    "bayer 04 leverkusen": "bayer 04 leverkusen",
+    # Serie A - Inter Milan vs The Odds API's 'FC Internazionale'
+    "inter": "fc internazionale",
+    "inter milan": "fc internazionale",
+    "fc internazionale": "fc internazionale",
+    "internazionale": "fc internazionale",
+    "milan": "ac milan",
+    "ac milan": "ac milan",
+    "juventus": "juventus fc",
+    "juventus fc": "juventus fc",
+    "as roma": "as roma",
+    "lazio": "ss lazio",
+    "ss lazio": "ss lazio",
+    "napoli": "ssc napoli",
+    "ssc napoli": "ssc napoli",
+    "venezia": "venezia fc",
+    "venezia fc": "venezia fc",
+    "parma": "parma calcio 1913",
+    "parma calcio 1913": "parma calcio 1913",
+    # Ligue 1 - short vs long forms
+    "brest": "stade brestois 29",
+    "stade brestois 29": "stade brestois 29",
+    "stade brestois": "stade brestois 29",
+    "lille": "losc lille",
+    "losc lille": "losc lille",
+    "rennes": "stade rennais fc",
+    "stade rennais": "stade rennais fc",
+    "marseille": "olympique de marseille",
+    "olympique de marseille": "olympique de marseille",
+    "lyon": "olympique lyonnais",
+    "olympique lyonnais": "olympique lyonnais",
+    "strasbourg": "rc strasbourg alsace",
+    "le havre": "le havre ac",
+    "le havre ac": "le havre ac",
+    "lens": "rc lens",
+    "rc lens": "rc lens",
+    # PL - FPL bootstrap uses short nicknames
+    "wolves": "wolverhampton wanderers",
+    "wolverhampton wanderers": "wolverhampton wanderers",
+    "spurs": "tottenham hotspur",
+    "tottenham hotspur": "tottenham hotspur",
+    "nott'm forest": "nottingham forest",
+    "nottingham forest": "nottingham forest",
+    "man utd": "manchester united",
+    "manchester united": "manchester united",
+    "man city": "manchester city",
+    "manchester city": "manchester city",
+    # Spain - diacritic + suffix variations
+    "alaves": "deportivo alaves",
+    "deportivo alaves": "deportivo alaves",
+    "malaga": "malaga cf",
+    "malaga cf": "malaga cf",
+    "betis": "real betis",
+    "real betis": "real betis",
+    "racing santander": "racing club de santander",
+    "racing": "racing club de santander",
+    # 1. FC Koln vs FC Koln vs Koln
+    "koln": "1 fc koln",
+    "fc koln": "1 fc koln",
+    "1 fc koln": "1 fc koln",
+}
 
 
 def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
-    home_norm = _normalize_team_name(home_name)
-    away_norm = _normalize_team_name(away_name)
+    """Find the odds event matching a fixture.
+
+    Bug fix (Phase 2): the previous version used raw substring containment
+    with the *old* normalisation (no diacritics, no leading-prefix strip),
+    which is why 'FC Bayern München' never matched 'Bayern Munich' and
+    Bayern's odds silently fell off. New approach:
+      1. Strip diacritics + leading prefixes via _normalize_team_name.
+      2. Resolve provider-specific aliases via _TEAM_NAME_ALIASES.
+      3. Match by exact equality OR substring WITH a length-ratio guard
+         (shorter must be >= 50% of the longer) to prevent single-word
+         false positives like 'milan' matching inside 'inter milan'.
+    """
+    home_canon = _TEAM_NAME_ALIASES.get(_normalize_team_name(home_name), _normalize_team_name(home_name))
+    away_canon = _TEAM_NAME_ALIASES.get(_normalize_team_name(away_name), _normalize_team_name(away_name))
     for event in odds_events:
-        eh = _normalize_team_name(event.get("home_team", ""))
-        ea = _normalize_team_name(event.get("away_team", ""))
-        if (eh in home_norm or home_norm in eh) and (ea in away_norm or away_norm in ea):
-            return event
+        eh = _TEAM_NAME_ALIASES.get(
+            _normalize_team_name(event.get("home_team", "")),
+            _normalize_team_name(event.get("home_team", "")),
+        )
+        ea = _TEAM_NAME_ALIASES.get(
+            _normalize_team_name(event.get("away_team", "")),
+            _normalize_team_name(event.get("away_team", "")),
+        )
+        # home match: equal OR substring with ratio guard (>=50%)
+        if not _match_strong(home_canon, eh):
+            continue
+        if not _match_strong(away_canon, ea):
+            continue
+        return event
     return {}
+
+
+def _match_strong(a: str, b: str) -> bool:
+    """Match a and b by equality or substring containment with a 50% length-
+    ratio guard. Prevents 'milan' matching inside 'inter milan' (5/11 = 0.45
+    < 0.5) while still matching 'bayern munchen' inside itself."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < 0.5 * len(long):
+        return False
+    return short in long
 
 
 def _extract_odds_snapshot(odds_event: dict) -> dict:
@@ -802,6 +961,41 @@ async def _deep_analyze(
         if head_to_head:
             score += 0.1
         structured["data_completeness"] = round(score, 2)
+
+    # Rescue clause (Phase 2): when football-data.org gave us rich standings +
+    # odds + weather, the LLM is allowed to report a conservative
+    # completeness (early-season form/H2H often come back UNKNOWN).
+    # Take the max of the LLM's number and our deterministic count so a
+    # well-stocked match is never artificially deflated (e.g. Bayern vs
+    # Stuttgart: LLM reported 0.40 because form/H2H were UNKNOWN, but
+    # local data clearly merits >= 0.65).
+    local_count = 0
+    if odds_snapshot:
+        local_count += 1
+    if home_standing or away_standing:
+        local_count += 1
+    if home_form or away_form:
+        local_count += 1
+    if head_to_head:
+        local_count += 1
+    if weather.get("temp_c") is not None:
+        local_count += 1
+    if local_count >= 4:
+        floor = 0.65
+        if (home_standing and away_standing
+                and home_standing.get("position") and away_standing.get("position")):
+            floor = max(floor, 0.75)
+        if (head_to_head and head_to_head.get("matches_played")
+                and home_form and away_form
+                and home_form.get("results") and away_form.get("results")):
+            floor = max(floor, 0.85)
+        if structured["data_completeness"] < floor:
+            logger.info(
+                f"[SCOUT] LLM reported completeness "
+                f"{structured['data_completeness']} but local data covers "
+                f"{local_count}/5 evidence categories - bumping to {floor}."
+            )
+            structured["data_completeness"] = floor
 
     structured.setdefault("fixture_id", fixture_id)
     if not structured.get("odds_snapshot") and odds_snapshot:
