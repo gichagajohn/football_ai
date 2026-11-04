@@ -1,45 +1,31 @@
-"""
-DAILY RUN — Football Pulse AI (GitHub Actions edition)
-This is the entrypoint script run by the GitHub Actions daily workflow.
-It:
-  1. Checks outcomes of past published tickets (Memory Agent input)
-  2. Runs the full prediction pipeline for today
-  3. Emails the resulting ticket
-"""
-import asyncio
+import os
 import logging
-from datetime import date
-from backend.pipeline import run_pipeline
-from backend.email_sender import send_email
-from backend import result_checker
+from datetime import datetime
+from backend.pipeline import run_daily_pipeline
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("daily_run")
+logger = logging.getLogger("backend.daily_runner")
 
+def main():
+    logger.info("Initializing daily football prediction run...")
+    
+    # Verify critical environment variables before starting
+    required_vars = ["SUPABASE_URL", "SUPABASE_KEY", "FOOTBALL_DATA_KEY"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing:
+        logger.error(f"Missing critical environment variables: {', '.join(missing)}")
+        raise EnvironmentError(f"Missing environment variables: {missing}")
 
-async def main():
-    today = date.today()
-
-    # ── Step 1: Check outcomes of past tickets ──────────────────
-    logger.info("Checking outcomes of past tickets...")
     try:
-        result_checker.run(today=today)
+        run_daily_pipeline()
+        logger.info("Daily pipeline executed successfully.")
     except Exception as e:
-        logger.error(f"Result checking failed (non-fatal): {e}")
-
-    # ── Step 2: Run the prediction pipeline ─────────────────────
-    logger.info("Running prediction pipeline...")
-    ticket = await run_pipeline(target_date=today)
-
-    # ── Step 3: Email the ticket ────────────────────────────────
-    subject = f"⚽ Football Pulse AI — Daily Ticket ({today.isoformat()})"
-    send_email(subject, ticket)
-
-    logger.info("Daily run complete.")
-
+        logger.exception(f"Pipeline execution failed: {e}")
+        raise e
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
