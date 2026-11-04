@@ -28,11 +28,19 @@ create table if not exists ticket_selections (
     market text,
     odds numeric,
     rationale text,
-    outcome text default 'pending'            -- pending | win | loss | void
+    outcome text default 'pending',           -- pending | win | loss | void
+    home_score smallint,
+    away_score smallint,
+    constraint ticket_selections_unique_pick unique (ticket_date, fixture_id, market)
 );
 
 create index if not exists idx_tickets_date on prediction_tickets(ticket_date);
 create index if not exists idx_selections_date on ticket_selections(ticket_date);
+
+-- For databases created with an older version of this schema, run the
+-- migration in backend/db/migrations/20261104_result_storage_and_dedupe.sql.
+-- It adds the score columns, removes old duplicates, and creates the matching
+-- unique index required by the application's idempotent selection inserts.
 
 -- ============================================================
 -- Row Level Security (RLS)

@@ -88,7 +88,9 @@ def store_ticket(
         "risk_level": portfolio.get("risk_level"),
         "reason": decision.get("reason"),
         "ticket_text": ticket_text,
-        "outcome": "pending",
+        # Do not send outcome on an upsert. The database default sets new
+        # tickets to 'pending', while omitting it here preserves an already
+        # graded outcome when a daily workflow is rerun for the same date.
     }
 
     try:
@@ -133,12 +135,22 @@ def store_ticket(
     try:
         resp = httpx.post(
             f"{SUPABASE_URL}/rest/v1/ticket_selections",
-            headers=HEADERS,
+            # A matching unique index exists on
+            # (ticket_date, fixture_id, market). Ignore an existing selection
+            # rather than inserting a duplicate or resetting its graded result.
+            headers={
+                **HEADERS,
+                "Prefer": "resolution=ignore-duplicates, return=minimal",
+            },
+            params={"on_conflict": "ticket_date,fixture_id,market"},
             json=selection_rows,
             timeout=15,
         )
         resp.raise_for_status()
-        logger.info(f"[SUPABASE] Stored {len(selection_rows)} selection(s).")
+        logger.info(
+            f"[SUPABASE] Submitted {len(selection_rows)} selection(s); "
+            "existing selections were preserved."
+        )
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to store selections: {e}")
 
@@ -192,14 +204,13 @@ def update_selection_outcome(
     outcome: str,
     home_score: int | None = None,
     away_score: int | None = None,
-) -> None:
+) -> bool:
     """
     Update a single selection's outcome (win/loss/void) and, if known,
-    the final match score. home_score/away_score are optional so this
-    function still works for callers that only have the outcome.
+    the final match score. Returns True only when Supabase accepts the write.
     """
     if not _enabled():
-        return
+        return False
     payload = {"outcome": outcome}
     if home_score is not None:
         payload["home_score"] = home_score
@@ -214,14 +225,21 @@ def update_selection_outcome(
             timeout=15,
         )
         resp.raise_for_status()
+        return True
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"[SUPABASE] Failed to update selection {selection_id}: {e}; "
+            f"response={e.response.text}"
+        )
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to update selection {selection_id}: {e}")
+    return False
 
 
-def update_ticket_outcome(ticket_date: date, outcome: str) -> None:
-    """Update a ticket's overall outcome (win = all selections won, loss = at least one lost)."""
+def update_ticket_outcome(ticket_date: date, outcome: str) -> bool:
+    """Update a ticket's overall outcome and report whether the write succeeded."""
     if not _enabled():
-        return
+        return False
     try:
         resp = httpx.patch(
             f"{SUPABASE_URL}/rest/v1/prediction_tickets",
@@ -232,8 +250,15 @@ def update_ticket_outcome(ticket_date: date, outcome: str) -> None:
         )
         resp.raise_for_status()
         logger.info(f"[SUPABASE] Updated ticket {ticket_date} outcome -> {outcome}")
+        return True
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"[SUPABASE] Failed to update ticket outcome: {e}; "
+            f"response={e.response.text}"
+        )
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to update ticket outcome: {e}")
+    return False
 
 
 def get_recent_tickets(limit: int = 30) -> list[dict]:

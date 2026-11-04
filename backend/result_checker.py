@@ -103,8 +103,16 @@ def fetch_result(fixture_id: int) -> dict | None:
 
     try:
         resp = _fd_get(f"{FOOTBALL_DATA_BASE}/matches/{fixture_id}")
-        data = resp.json().get("match")
-        if not data:
+
+        # /v4/matches/{id} returns a single Match resource at the top level.
+        # List endpoints use a "matches" wrapper, but this endpoint does NOT
+        # wrap the object in a "match" key. Looking for that key silently
+        # discarded every successful response and left all selections pending.
+        data = resp.json()
+        if not isinstance(data, dict) or not data:
+            logger.warning(
+                f"[RESULT_CHECK] Match {fixture_id} returned an unexpected empty/non-object payload."
+            )
             return None
 
         status = data.get("status")
@@ -178,10 +186,19 @@ def run(today: date | None = None) -> None:
         logger.info("[RESULT_CHECK] No pending tickets to check.")
         return
 
+    logger.info(f"[RESULT_CHECK] Found {len(pending_tickets)} pending ticket(s).")
+
+    # Several old selections can reference the same fixture. Fetch each match
+    # at most once per run, while still grading every database selection.
+    result_cache: dict[int, dict | None] = {}
+    updated_selections = 0
+    completed_tickets = 0
+
     for ticket in pending_tickets:
         ticket_date = date.fromisoformat(ticket["ticket_date"])
         selections = supabase_client.get_selections_for_date(ticket_date)
         if not selections:
+            logger.warning(f"[RESULT_CHECK] Ticket {ticket_date} has no selections; leaving it pending.")
             continue
 
         all_graded = True
@@ -196,21 +213,35 @@ def run(today: date | None = None) -> None:
                     any_void_only = False
                 continue
 
-            result = fetch_result(sel["fixture_id"])
+            fixture_id = int(sel["fixture_id"])
+            if fixture_id not in result_cache:
+                result_cache[fixture_id] = fetch_result(fixture_id)
+            result = result_cache[fixture_id]
+
             if result is None:
                 all_graded = False
                 continue
 
             outcome = grade_selection(sel["market"], result["home_goals"], result["away_goals"])
 
-            # Store the outcome AND the final score (Phase 2 addition) so the
-            # website can display real scorelines, not just win/loss badges.
-            supabase_client.update_selection_outcome(
+            # Store the outcome AND the final score so the website's Results
+            # page can display real scorelines, not just win/loss badges.
+            updated = supabase_client.update_selection_outcome(
                 sel["id"], outcome,
                 home_score=result["home_goals"],
                 away_score=result["away_goals"],
             )
+            if not updated:
+                # Never mark a ticket complete when one of its database writes
+                # failed. The next run can safely retry the pending selection.
+                all_graded = False
+                logger.error(
+                    f"[RESULT_CHECK] Could not save selection {sel['id']} "
+                    f"for fixture {fixture_id}; it remains pending."
+                )
+                continue
 
+            updated_selections += 1
             logger.info(
                 f"[RESULT_CHECK] {sel['home_team']} vs {sel['away_team']} "
                 f"({sel['market']}) -> {outcome} "
@@ -229,7 +260,13 @@ def run(today: date | None = None) -> None:
                 ticket_outcome = "void"
             else:
                 ticket_outcome = "win"
-            supabase_client.update_ticket_outcome(ticket_date, ticket_outcome)
+            if supabase_client.update_ticket_outcome(ticket_date, ticket_outcome):
+                completed_tickets += 1
+
+    logger.info(
+        f"[RESULT_CHECK] Finished: {updated_selections} selection(s) updated, "
+        f"{completed_tickets} ticket(s) completed, {len(result_cache)} unique fixture(s) fetched."
+    )
 
 
 if __name__ == "__main__":
