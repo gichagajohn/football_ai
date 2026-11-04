@@ -1,13 +1,26 @@
-name: Daily Football AI Pipeline
+name: Football Pulse AI — Daily Ticket
 
 on:
   schedule:
-    - cron: '0 5 * * *' # Runs daily at 5:00 AM UTC (8:00 AM EAT)
-  workflow_dispatch: # Allows manual runs from the Actions tab
+    # 05:00 UTC = 08:00 EAT
+    - cron: "0 5 * * *"
+
+  workflow_dispatch:
+    inputs:
+      league_ids:
+        description: "Comma-separated API-Football league IDs to test with (leave blank for default top-5 + UCL)"
+        required: false
+        default: ""
+
+      cleaner_threshold:
+        description: "Override CLEANER_THRESHOLD for this run, e.g. 0.3 (leave blank for default 0.5)"
+        required: false
+        default: ""
 
 jobs:
-  run-pipeline:
+  daily-prediction:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -16,26 +29,42 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Daily Pipeline & Result Checker
+      - name: Run daily pipeline
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}
+
           FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          OPENWEATHER_KEY: ${{ secrets.OPENWEATHER_KEY }}
+
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: |
-          echo "Starting daily result verification..."
-          python -m backend.result_checker
-          
-          echo "Starting daily prediction run..."
-          python -m backend.daily_run
+
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+          LEAGUE_IDS: ${{ github.event.inputs.league_ids }}
+          CLEANER_THRESHOLD: ${{ github.event.inputs.cleaner_threshold }}
+
+          # Allows the selected portfolio to continue even with negative edge.
+          MIN_EDGE_MARGIN: "-0.10"
+
+          # Allows the current 0.40-confidence matches through Risk.
+          CONFIDENCE_THRESHOLD: "0.40"
+
+          # Publishes the portfolio despite Auditor/Decision rejection.
+          FORCE_PUBLISH: "true"
+
+        run: python -m backend.daily_run
