@@ -18,27 +18,34 @@ from backend.gemini_client import gemini_chat as _gemini_chat, get_last_finish_r
 
 logger = logging.getLogger(__name__)
 
+# Confirmed accessible on the current football-data free plan. The optional
+# competitions returned plan-related 403s on 2026-11-05 and are disabled only
+# by default; LEAGUE_IDS can re-enable them after provider coverage changes.
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
     "ELC": "Championship (England)",
-    "FAC": "FA Cup",
     "PD": "La Liga",
-    "CDR": "Copa del Rey",
     "BL1": "Bundesliga",
-    "DFB": "DFB-Pokal",
     "SA": "Serie A",
-    "CIT": "Coppa Italia",
     "FL1": "Ligue 1",
     "DED": "Eredivisie",
     "PPL": "Primeira Liga",
     "BSA": "Campeonato Brasileiro Série A",
     "CL": "UEFA Champions League",
+}
+
+OPTIONAL_LEAGUE_IDS = {
+    "FAC": "FA Cup",
+    "CDR": "Copa del Rey",
+    "DFB": "DFB-Pokal",
+    "CIT": "Coppa Italia",
     "EL": "UEFA Europa League",
     "UCL": "UEFA Conference League",
 }
 
 KNOWN_LEAGUE_NAMES = {
     **DEFAULT_LEAGUE_IDS,
+    **OPTIONAL_LEAGUE_IDS,
     "DED": "Eredivisie",
     "PPL": "Primeira Liga",
     "ELC": "Championship (England)",
@@ -194,6 +201,26 @@ TEAM_HOME_CITY: dict[str, str] = {
     "vitoria sc": "Guimaraes", "vitoria guimaraes": "Guimaraes",
     "rio ave fc": "Vila do Conde", "rio ave": "Vila do Conde",
     "gil vicente fc": "Barcelos", "gil vicente": "Barcelos",
+    # Brazil (fast path for current and recent Série A clubs)
+    "palmeiras": "São Paulo", "se palmeiras": "São Paulo",
+    "sao paulo": "São Paulo", "são paulo": "São Paulo",
+    "corinthians": "São Paulo", "corinthians paulista": "São Paulo",
+    "santos": "Santos", "flamengo": "Rio de Janeiro",
+    "fluminense": "Rio de Janeiro", "vasco da gama": "Rio de Janeiro",
+    "botafogo fr": "Rio de Janeiro", "botafogo de futebol e regatas": "Rio de Janeiro",
+    "botafogo sp": "Ribeirão Preto",
+    "atletico mineiro": "Belo Horizonte", "ca mineiro": "Belo Horizonte",
+    "america mineiro": "Belo Horizonte", "cruzeiro": "Belo Horizonte", "cruzeiro ec": "Belo Horizonte",
+    "gremio": "Porto Alegre", "internacional": "Porto Alegre",
+    "athletico paranaense": "Curitiba", "coritiba": "Curitiba",
+    "bahia": "Salvador", "ec bahia": "Salvador",
+    "ec vitoria": "Salvador", "vitoria ec": "Salvador",
+    "fortaleza": "Fortaleza", "ceara": "Fortaleza",
+    "sport recife": "Recife", "remo": "Belém", "clube do remo": "Belém",
+    "paysandu": "Belém", "bragantino": "Bragança Paulista",
+    "mirassol": "Mirassol", "chapecoense": "Chapecó",
+    "juventude": "Caxias do Sul", "atletico goianiense": "Goiânia",
+    "goias": "Goiânia", "cuiaba": "Cuiabá",
     # Countries (fallback)
     "united states": "New York", "usa": "New York", "mexico": "Mexico City",
     "canada": "Toronto", "brazil": "Rio de Janeiro", "argentina": "Buenos Aires",
@@ -249,6 +276,63 @@ def _get_venue_city(home_team_name: str) -> str | None:
             return city
         key_norm = _normalize_team_name_for_lookup(key)
         if key_norm in name_norm or name_norm in key_norm:
+            return city
+    return None
+
+
+_LOCATION_POSTCODE = re.compile(
+    r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b"
+    r"|\b\d{4}\s*[A-Z]{2}\b"
+    r"|\b\d{4,6}(?:-\d{3,4})?\b",
+    re.IGNORECASE,
+)
+_NON_CITY_ADDRESS_PARTS = {
+    "brazil", "brasil", "deutschland", "england", "espana", "europe", "france",
+    "germany", "great britain", "italia", "italy", "netherlands", "portugal",
+    "scotland", "spain", "the netherlands", "uk", "united kingdom", "wales",
+}
+_STREET_WORDS = {
+    "allee", "avenida", "avenue", "boulevard", "drive", "lane", "piazza", "place",
+    "platz", "road", "rua", "strasse", "street", "via", "viale", "weg",
+}
+
+
+def _location_key(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", _strip_accents(text))).strip()
+
+
+def _city_from_team_profile(team: dict) -> str | None:
+    """Derive a city from a football-data team profile without guessing a venue."""
+    address = str(team.get("address") or "").strip()
+    if not address:
+        return None
+
+    known_cities = sorted(
+        set(TEAM_HOME_CITY.values()), key=lambda city: len(_location_key(city)), reverse=True
+    )
+    for raw_part in reversed(address.split(",")):
+        part = _LOCATION_POSTCODE.sub(" ", raw_part)
+        part = re.sub(r"\b\d+[A-Z]?\b", " ", part, flags=re.IGNORECASE)
+        part = re.sub(r"\s+[A-Z]{2}$", "", part.strip())
+        part = re.sub(r"\s+", " ", part).strip(" \t-–—.")
+        key = _location_key(part)
+        if not key or len(key) > 50 or key in _NON_CITY_ADDRESS_PARTS:
+            continue
+        if len(key) <= 2 and raw_part.strip().isupper():
+            continue
+        if any(re.search(rf"\b{word}\b", key) for word in _STREET_WORDS):
+            continue
+        for city in known_cities:
+            if key == _location_key(city):
+                return city
+        return part
+
+    # Some providers return an unseparated street/city string. Only in that
+    # fallback case, accept a whole known city name contained in the address.
+    address_key = f" {_location_key(address)} "
+    for city in known_cities:
+        city_key = _location_key(city)
+        if city_key and f" {city_key} " in address_key:
             return city
     return None
 
@@ -383,6 +467,33 @@ async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None)
     if last_exc:
         raise last_exc
     return {}
+
+
+async def fetch_competition_home_cities(
+    http: httpx.AsyncClient,
+    competition_code: str,
+) -> dict[int, str]:
+    """Load registered home cities once for teams missing the manual map."""
+    try:
+        data = await _fd_get(http, f"{FOOTBALL_DATA_BASE}/competitions/{competition_code}/teams")
+    except Exception as exc:
+        logger.warning(f"[SCOUT] Team-address fetch failed for {competition_code}: {exc}")
+        return {}
+
+    teams = data.get("teams", []) if isinstance(data, dict) else []
+    cities: dict[int, str] = {}
+    for team in teams:
+        try:
+            team_id = int(team.get("id"))
+        except (TypeError, ValueError):
+            continue
+        city = _city_from_team_profile(team)
+        if city:
+            cities[team_id] = city
+    logger.info(
+        f"[SCOUT] Resolved {len(cities)}/{len(teams)} registered home cities for {competition_code}."
+    )
+    return cities
 
 
 async def fetch_standings(http: httpx.AsyncClient, competition_code: str) -> dict[int, dict]:
@@ -1111,6 +1222,7 @@ async def _deep_analyze(
     epl_injuries: dict,
     fd_http: httpx.AsyncClient,
     standings_cache: dict[str, dict],
+    team_city_cache: dict[str, dict[int, str]],
     team_form_cache: dict[int, dict],
 ) -> dict:
     fixture_id = fixture["id"]
@@ -1120,13 +1232,22 @@ async def _deep_analyze(
     home_id = fixture.get("homeTeam", {}).get("id")
     away_id = fixture.get("awayTeam", {}).get("id")
 
-    venue_city = (
-        _get_venue_city(home_name)
-        or fixture.get("homeTeam", {}).get("venue")
-        or fixture.get("venue")
-    )
+    venue_city = _get_venue_city(home_name)
+    venue_city_source = "manual club map" if venue_city else None
+    if not venue_city and competition_code and home_id is not None:
+        if competition_code not in team_city_cache:
+            team_city_cache[competition_code] = await fetch_competition_home_cities(
+                fd_http, competition_code
+            )
+        venue_city = team_city_cache[competition_code].get(home_id)
+        if venue_city:
+            venue_city_source = "football-data registered club address"
+    if not venue_city:
+        venue_city = fixture.get("homeTeam", {}).get("venue") or fixture.get("venue")
+        if venue_city:
+            venue_city_source = "fixture venue field"
     if venue_city:
-        logger.info(f"[SCOUT] Venue city for {home_name}: {venue_city}")
+        logger.info(f"[SCOUT] Venue city for {home_name}: {venue_city} ({venue_city_source}).")
     else:
         logger.info(f"[SCOUT] No venue city found for {home_name} — skipping weather.")
 
@@ -1165,6 +1286,7 @@ async def _deep_analyze(
         "away_injuries": away_injuries,
         "weather": weather,
         "venue_city": venue_city,
+        "venue_city_source": venue_city_source,
         "recent_form": {"home": home_form, "away": away_form},
         "head_to_head": head_to_head,
         "standings": {"home": home_standing, "away": away_standing},
@@ -1250,6 +1372,8 @@ async def _deep_analyze(
         "standings": {"home": home_standing, "away": away_standing},
         "injuries": {"home": home_injuries, "away": away_injuries},
         "weather": weather,
+        "venue_city": venue_city,
+        "venue_city_source": venue_city_source,
         "odds_source": odds_snapshot.get("_source"),
         "odds_bookmakers": odds_snapshot.get("_bookmakers", []),
         "odds_last_update": odds_snapshot.get("_last_update"),
@@ -1265,7 +1389,7 @@ async def _deep_analyze(
 async def run(target_date: date | None = None) -> list[dict]:
     """
     Main scout agent entrypoint.
-    Weather: fetched via TEAM_HOME_CITY lookup when API doesn't return venue.
+    Weather uses the manual home-city map, then registered club addresses.
     """
     target_date = target_date or date.today()
     league_names = list(TOP_LEAGUE_IDS.values())
@@ -1316,6 +1440,7 @@ async def run(target_date: date | None = None) -> list[dict]:
     results: list[dict] = []
     cursor = 0
     standings_cache: dict[str, dict] = {}
+    team_city_cache: dict[str, dict[int, str]] = {}
     team_form_cache: dict[int, dict] = {}
 
     async with httpx.AsyncClient(timeout=20) as fd_http:
@@ -1334,7 +1459,8 @@ async def run(target_date: date | None = None) -> list[dict]:
             )
             for fixture, odds_event in batch:
                 structured = await _deep_analyze(
-                    fixture, odds_event, epl_injuries, fd_http, standings_cache, team_form_cache
+                    fixture, odds_event, epl_injuries, fd_http,
+                    standings_cache, team_city_cache, team_form_cache,
                 )
                 results.append(structured)
 

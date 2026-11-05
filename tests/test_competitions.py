@@ -8,10 +8,14 @@ from backend.agents import scout_agent
 from backend.models import poisson_service
 
 
-def test_many_competitions_and_unlimited_scout_are_default():
-    expected = {"PL", "ELC", "FAC", "PD", "CDR", "BL1", "DFB", "SA", "CIT", "FL1", "DED", "PPL", "BSA", "CL", "EL", "UCL"}
-    assert expected <= set(scout_agent.DEFAULT_LEAGUE_IDS)
-    assert expected <= set(scout_agent.ODDS_SPORT_KEYS)
+def test_free_plan_competitions_are_default_and_blocked_feeds_remain_optional():
+    default = {"PL", "ELC", "PD", "BL1", "SA", "FL1", "DED", "PPL", "BSA", "CL"}
+    optional = {"FAC", "CDR", "DFB", "CIT", "EL", "UCL"}
+    assert set(scout_agent.DEFAULT_LEAGUE_IDS) == default
+    assert set(scout_agent.OPTIONAL_LEAGUE_IDS) == optional
+    assert default.isdisjoint(optional)
+    assert default | optional <= set(scout_agent.KNOWN_LEAGUE_NAMES)
+    assert default | optional <= set(scout_agent.ODDS_SPORT_KEYS)
     assert scout_agent.HARD_CAP_MATCHES == 0
 
 

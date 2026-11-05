@@ -51,18 +51,23 @@ so no selection is truncated; this is a formatting threshold, not a bet limit.
 
 ## Competitions and fixture coverage
 
-The default configuration includes 16 competitions:
+The default configuration uses the 10 competitions confirmed accessible on the
+current football-data free plan:
 
 ```text
 PL   Premier League                 ELC  English Championship
-FAC  FA Cup                         PD   La Liga
-CDR  Copa del Rey                   BL1  Bundesliga
-DFB  DFB-Pokal                      SA   Serie A
-CIT  Coppa Italia                   FL1  Ligue 1
+PD   La Liga                        BL1  Bundesliga
+SA   Serie A                        FL1  Ligue 1
 DED  Eredivisie                     PPL  Primeira Liga
 BSA  Brazil Série A                 CL   UEFA Champions League
-EL   UEFA Europa League             UCL  UEFA Conference League
 ```
+
+These six remain defined but are disabled by default after their fixture feeds
+returned plan-related `403` responses on 2026-11-05: `FAC` (FA Cup), `CDR`
+(Copa del Rey), `DFB` (DFB-Pokal), `CIT` (Coppa Italia), `EL` (UEFA Europa
+League), and `UCL` (UEFA Conference League). After provider coverage changes,
+re-enable them through `LEAGUE_IDS`. The override replaces the default list, so
+include every desired competition code—not only the newly enabled ones.
 
 Every returned fixture with a matched bookmaker event is processed; the old
 12/18-fixture stopping rules are removed. Unpriced fixtures are skipped early
@@ -78,6 +83,21 @@ the available provider event names/kickoffs for diagnosis.
 Use a comma-separated `LEAGUE_IDS` override to run a subset when quota is
 limited. `SCOUT_HARD_CAP_MATCHES=0` means no fixture cap; a positive value is
 available only as an emergency quota control.
+
+### Home-city and weather coverage
+
+The Scout uses a manual club-city map, including current/recent Brazilian Série A
+clubs, and then falls back to registered club addresses from football-data's
+competition team profiles. The latter costs at most one additional paced request
+per competition containing an unmapped, priceable home team and is cached for
+the run. Missing or ambiguous addresses skip weather rather than inventing a
+location. The selected city and its source are logged.
+
+Weather can add useful heavy-rain, wind, and temperature context, but it is not
+automatically evidence of predictive improvement. It remains Scout/risk-review
+context and does not alter Dixon–Coles probabilities. A weather adjustment to
+the numerical model would require separate holdout/backtest evidence. Neutral
+or relocated matches can differ from a club's usual home city.
 
 ## Learning from results
 

@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       league_ids:
-        description: "Comma-separated football-data competition codes (blank = all 16 configured competitions)"
+        description: "Comma-separated competition codes (blank = 10 free-plan competitions; optional cups/UEFA require plan access)"
         required: false
         default: ""
 
