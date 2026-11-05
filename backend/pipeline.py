@@ -81,7 +81,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
             f"Discipline over volume. We wait.\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
-        logger.warning(f"NO BET TODAY — Scout found no fixtures for {date_str}.")
+        logger.warning(f"NO BET TODAY — Scout found no priceable fixtures for {date_str}.")
         supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "No priceable fixtures found."})
         return ticket
 

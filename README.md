@@ -29,11 +29,16 @@ probabilities or add accumulator legs.
    It never pads a ticket to reach a target. Empty qualifying sets return
    **NO BET**.
 
-Direct 1X2, over-2.5, and BTTS prices come from The Odds API. Double-chance and
-draw-no-bet prices are reproducibly derived from quoted 1X2 prices and are
-labeled `derived_from_bookmaker_1x2`. Joint probability assumes independence
-between fixtures and is an estimate, not a guarantee. Longer tickets normally
-have much lower joint win probability even when every leg passes the EV gate.
+Direct 1X2 and over-2.5 prices come from The Odds API's featured bulk markets
+(`h2h,totals`), with `h2h` as a fallback when the provider rejects a bundled
+market request. BTTS probabilities are still computed by Dixon–Coles, and the
+parser can accept BTTS prices if supplied, but BTTS is not requested by default:
+The Odds API classifies it as an additional market requiring per-event requests.
+Double-chance and draw-no-bet prices are reproducibly derived from quoted 1X2
+prices and are labeled `derived_from_bookmaker_1x2`. Joint probability assumes
+independence between fixtures and is an estimate, not a guarantee. Longer
+tickets normally have much lower joint win probability even when every leg
+passes the EV gate.
 
 `FORCE_PUBLISH: "true"` bypasses only Gemini Auditor/Decision warnings. It
 cannot bypass history, model metadata, probability, EV, unique-fixture, finite

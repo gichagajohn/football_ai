@@ -2,6 +2,8 @@ import asyncio
 from datetime import date
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from backend.agents import scout_agent
 from backend.models import poisson_service
 
@@ -44,3 +46,24 @@ def test_odds_catalog_resolves_provider_specific_aliases():
     assert resolved == {
         "FAC": "soccer_fa_cup", "ELC": "soccer_efl_champ", "PL": "soccer_epl",
     }
+
+
+def test_football_data_403_is_diagnosed_as_access_not_rate_limit():
+    response = Mock()
+    response.status_code = 403
+    response.text = '{"message":"Competition not available in your plan private-token"}'
+    client = AsyncMock()
+    client.get.return_value = response
+    with (
+        patch.object(scout_agent, "_fd_pace", new=AsyncMock()),
+        patch.dict(scout_agent.os.environ, {"FOOTBALL_DATA_KEY": "private-token"}),
+        pytest.raises(RuntimeError) as error,
+    ):
+        asyncio.run(scout_agent._fd_get(client, "https://example.invalid/competitions/FAC/matches"))
+    message = str(error.value)
+    assert "competition-plan coverage" in message
+    assert "not 429 rate limiting" in message
+    assert "Competition not available" in message
+    assert "private-token" not in message
+    assert "[REDACTED]" in message
+    assert client.get.call_count == 1

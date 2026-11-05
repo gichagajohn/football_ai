@@ -363,6 +363,17 @@ async def _fd_get(http: httpx.AsyncClient, url: str, params: dict | None = None)
             )
             await asyncio.sleep(wait)
             continue
+        if resp.status_code == 403:
+            detail = resp.text[:400]
+            token = os.environ.get("FOOTBALL_DATA_KEY", "")
+            if token:
+                detail = detail.replace(token, "[REDACTED]")
+            last_exc = RuntimeError(
+                "football-data.org access denied (403): check API-key authorization "
+                "or competition-plan coverage; this is not 429 rate limiting. "
+                f"Provider response: {detail}"
+            )
+            break
         try:
             resp.raise_for_status()
             return resp.json()
@@ -557,22 +568,51 @@ async def resolve_odds_sport_keys(competition_codes: set[str]) -> dict[str, str]
 
 
 async def fetch_league_odds(sport_key: str) -> list[dict]:
+    """Fetch featured markets, degrading to 1X2 if totals are unavailable.
+
+    BTTS is an additional market and is rejected by the bulk /odds endpoint
+    with INVALID_MARKET (422). It requires separate per-event requests, which
+    would consume substantially more quota, so it is intentionally not bundled.
+    """
     async with httpx.AsyncClient(timeout=20) as http:
-        try:
-            resp = await http.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-                params={
-                    "apiKey": os.environ.get("ODDS_API_KEY", ""),
-                    "regions": "eu",
-                    "markets": "h2h,totals,btts",
-                    "oddsFormat": "decimal",
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.warning(f"[SCOUT] Odds fetch failed for {sport_key}: {e}")
-            return []
+        for markets in ("h2h,totals", "h2h"):
+            try:
+                resp = await http.get(
+                    f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                    params={
+                        "apiKey": os.environ.get("ODDS_API_KEY", ""),
+                        "regions": "eu",
+                        "markets": markets,
+                        "oddsFormat": "decimal",
+                    },
+                )
+                if resp.status_code >= 400:
+                    # Log the provider diagnosis, but redact the credential even
+                    # if a future provider error unexpectedly echoes it back.
+                    detail = resp.text[:400]
+                    api_key = os.environ.get("ODDS_API_KEY", "")
+                    if api_key:
+                        detail = detail.replace(api_key, "[REDACTED]")
+                    logger.warning(
+                        f"[SCOUT] Odds response {resp.status_code} for {sport_key} "
+                        f"markets={markets}: {detail}"
+                    )
+                if resp.status_code == 422 and markets != "h2h":
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, list):
+                    logger.warning(f"[SCOUT] Odds payload for {sport_key} was not a list.")
+                    return []
+                logger.info(
+                    f"[SCOUT] Received odds for {sport_key}: {len(data)} event(s), "
+                    f"markets={markets}."
+                )
+                return data
+            except Exception as e:
+                logger.warning(f"[SCOUT] Odds fetch failed for {sport_key} markets={markets}: {e}")
+                return []
+        return []
 
 
 def _strip_accents(text: str) -> str:
