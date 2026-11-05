@@ -4,10 +4,14 @@ ANALYST / RISK / PORTFOLIO / AUDITOR / DECISION / PUBLISHER AGENTS — Football 
 
 import json
 import logging
+import math
 import os
 import re
 
 from backend.gemini_client import gemini_chat as _gemini_chat, get_last_finish_reason
+from backend.models.dixon_coles import MODEL_VERSION
+from backend.models.markets import blend_probabilities, normalized_implied, value_metrics
+from backend.models.learning import calibrate_probability
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +25,7 @@ IMPORTANT OUTPUT RULES:
 # Confidence threshold + edge margin — single source of truth.
 
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.60"))
-MIN_EDGE_MARGIN = float(os.environ.get("MIN_EDGE_MARGIN", "0.03"))
+MIN_EDGE_MARGIN = float(os.environ.get("MIN_EDGE_MARGIN", "0.0"))
 
 # Manual override. When enabled, a valid portfolio is published even if the
 # Auditor or final Decision agent rejects it.
@@ -32,64 +36,30 @@ FORCE_PUBLISH = (
 # ---------------------------------------------------------------------------
 # Combined odds configuration.
 
-COMBINED_ODDS_MIN = float(os.environ.get("COMBINED_ODDS_MIN", "0.0"))
-COMBINED_ODDS_MAX = float(os.environ.get("COMBINED_ODDS_MAX", "20.0"))
-COMBINED_ODDS_TARGET = (COMBINED_ODDS_MIN + COMBINED_ODDS_MAX) / 2
+COMBINED_ODDS_MIN = float(os.environ.get("COMBINED_ODDS_MIN", "1.0"))
+COMBINED_ODDS_MAX = float(os.environ.get("COMBINED_ODDS_MAX", "0.0"))  # 0 = no fixed cap
+MIN_SELECTIONS = max(1, int(os.environ.get("MIN_SELECTIONS", "1")))
+MAX_SELECTIONS = max(0, int(os.environ.get("MAX_SELECTIONS", "0")))  # 0 = all qualifying fixtures
+MIN_SELECTION_PROBABILITY = float(os.environ.get("MIN_SELECTION_PROBABILITY", "0.50"))
+POISSON_MARKET_WEIGHT = float(os.environ.get("POISSON_MARKET_WEIGHT", "0.35"))
+MIN_TEAM_HISTORY = int(os.environ.get("MIN_TEAM_HISTORY", "8"))
+PORTFOLIO_MAX_STAKE = min(0.10, max(0.0, float(os.environ.get("PORTFOLIO_MAX_STAKE", "0.02"))))
+PORTFOLIO_BEAM_WIDTH = max(20, int(os.environ.get("PORTFOLIO_BEAM_WIDTH", "200")))
+SELECTION_LIMIT_TEXT = (
+    f"{MIN_SELECTIONS} or more selections, with no fixed maximum"
+    if MAX_SELECTIONS == 0 else f"{MIN_SELECTIONS}-{MAX_SELECTIONS} selections"
+)
+ODDS_LIMIT_TEXT = (
+    f"combined odds >= {COMBINED_ODDS_MIN:.2f}, with no fixed maximum"
+    if COMBINED_ODDS_MAX <= 0 else f"combined odds {COMBINED_ODDS_MIN:.2f}-{COMBINED_ODDS_MAX:.2f}"
+)
 
-ANALYST_PROMPT = """You are the ANALYST AGENT for Football Pulse AI.
-You receive clean match data and must estimate probabilities for each market.
-
-The match data includes real fields fetched from a stats API:
-- recent_form.home / recent_form.away: {"results": "WLDWW" (most recent
-  first), "goals_for", "goals_against"} from each team's real last 5
-  finished matches, or {} if genuinely unavailable
-- head_to_head: {"matches_played", "home_wins", "draws", "away_wins"} from
-  the real last-10-meetings record, or {} if unavailable
-- standings.home / standings.away: {"position", "points", "goal_diff"} from
-  the real current league table, or {} if unavailable
-
-These are the ONLY source of "recent form", "head-to-head record", and
-"league position" — you do not have any other source for them, and you must
-never invent a plausible-looking form string, W-D-L record, or standings gap
-that isn't present in the data. If a field is {} (empty), that specific
-input is UNKNOWN — treat it as missing information, not as neutral/average
-form, and do not silently substitute a guess.
-
-Before scoring, you MUST fill in "supporting_stats" (see schema below)
-restating the ACTUAL values you were given for each factor — copy them, do
-not paraphrase or round them. This is required even when a factor is
-UNKNOWN; write "UNKNOWN" for that key rather than omitting it. A
-"supporting_stats" entry that doesn't match what was in the raw data is
-treated as a hallucination.
-
-Then compute model_confidence as an explicit calculation, not a single
-freeform number:
-1. Start from a base of 0.50.
-2. Adjust up/down based ONLY on the supporting_stats you just cited —
-   e.g. clear form advantage, H2H dominance, standings gap, confirmed
-   injuries to key players. State each adjustment and its direction/size
-   in "confidence_calculation".
-3. If two or more of recent_form/head_to_head/standings came back UNKNOWN
-   for this match, cap your final model_confidence at 0.60.
-4. Sum the adjustments onto the base for the final model_confidence.
-
-Do NOT default to a "safe-sounding" round number out of habit. Different
-matches with different supporting_stats should produce different confidence
-values.
-
-"confidence_calculation" must NEVER be an empty list. If there is no
-adjustment, explain why.
-
-Your analysis must be grounded in:
-- Recent form from recent_form
-- Head-to-head record from head_to_head
-- xG data if available
-- Home/away performance splits
-- Injuries to key players
-- League position and points gap from standings
-
-Probabilities must sum to 1.0 for mutually exclusive markets.
-All values must be between 0.0 and 1.0.""" + JSON_RULES
+SUPPORTED_MARKETS = (
+    "home_win", "draw", "away_win", "btts_yes", "over25",
+    "double_chance_home", "double_chance_away",
+    "draw_no_bet_home", "draw_no_bet_away",
+)
+TOURNAMENT_COMPETITIONS = {"CL", "EL", "UCL", "DFB", "FAC", "CIT", "CDR"}
 
 RISK_PROMPT = f"""You are the RISK AGENT for Football Pulse AI.
 Your job is to REJECT dangerous selections.
@@ -117,42 +87,6 @@ SOFT FLAGS:
 Return JSON: {{"approved": bool, "risk_level": "Low|Medium|High",
 "flags": [...], "rejection_reason": str|null}}""" + JSON_RULES
 
-PORTFOLIO_PROMPT = f"""You are the PORTFOLIO AGENT for Football Pulse AI.
-Construct the daily prediction ticket by selecting matches and markets only.
-
-You do not calculate odds yourself. Odds will be validated by the system after
-you choose the selections.
-
-TARGET: combined odds approximately {COMBINED_ODDS_TARGET:.1f}
-ACCEPTABLE RANGE: {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f}
-
-RULES:
-- Select 2-5 matches
-- Prefer higher-confidence matches
-- Use exact fixture IDs
-- Use exact market keys
-- Do not combine two markets from the same match
-- Do not select correct score or first goalscorer markets
-- Use only markets that can be priced from the available odds
-
-Allowed markets:
-- home_win
-- away_win
-- draw
-- btts_yes
-- over25
-- double_chance_home
-- double_chance_away
-- draw_no_bet_home
-- draw_no_bet_away
-
-Output JSON:
-{{"selections": [{{"fixture_id": int, "market": str, "rationale": str}}],
-"portfolio_confidence": float, "rationale": str}}
-
-If no portfolio can be built, output:
-{{"decision": "NO_BET", "reason": str}}""" + JSON_RULES
-
 AUDITOR_PROMPT = """You are the AUDITOR AGENT for Football Pulse AI.
 Act as the devil's advocate and challenge every selection.
 
@@ -176,8 +110,8 @@ You receive the final audited ticket and make the publish/no-bet call.
 
 PUBLISH IF:
 - Overall confidence >= {CONFIDENCE_THRESHOLD:.2f}
-- Combined odds within {COMBINED_ODDS_MIN:.1f}-{COMBINED_ODDS_MAX:.1f}
-- At least 2 selections are present
+- {ODDS_LIMIT_TEXT}
+- {SELECTION_LIMIT_TEXT}; no leg-count or odds target is imposed
 - No hard reject flags are active
 - Auditor verdict is APPROVE or REVISE
 
@@ -358,165 +292,142 @@ def _chunk(items: list, size: int) -> list[list]:
     ]
 
 
-def run_analyst(clean_matches: list[dict]) -> list[dict]:
+def _complete_market(odds: dict, keys: tuple[str, ...]) -> tuple[dict, float | None]:
+    if any(odds.get(key) is None for key in keys):
+        return {}, None
+    return normalized_implied({key: odds.get(key) for key in keys})
+
+
+def _blend_two_way(blended: dict, market: dict, yes_key: str, no_key: str) -> None:
+    if yes_key not in market or no_key not in market:
+        return
+    weight = POISSON_MARKET_WEIGHT
+    blended[yes_key] = (1 - weight) * blended[yes_key] + weight * market[yes_key]
+    blended[no_key] = (1 - weight) * blended[no_key] + weight * market[no_key]
+    total = blended[yes_key] + blended[no_key]
+    blended[yes_key] /= total
+    blended[no_key] /= total
+
+
+def run_analyst(clean_matches: list[dict], poisson_context: dict) -> list[dict]:
+    """Compute deterministic Dixon-Coles probabilities for usable fixtures."""
     probabilities = []
+    models = poisson_context.get("models", {})
 
-    for batch in _chunk(clean_matches, ANALYST_BATCH_SIZE):
-        match_lookup = {
-            m.get("fixture_id"): m
-            for m in batch
+    for match in clean_matches:
+        code = match.get("competition_code")
+        model = models.get(code)
+        home_id = match.get("home_team_id")
+        away_id = match.get("away_team_id")
+        label = f"{match.get('home_team')} vs {match.get('away_team')}"
+
+        if model is None:
+            logger.warning(f"[ANALYST] {label}: no fitted {code} history; skipping.")
+            continue
+        try:
+            home_id, away_id = int(home_id), int(away_id)
+            model_markets = model.probabilities(home_id, away_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(f"[ANALYST] {label}: unavailable team history ({exc}); skipping.")
+            continue
+
+        home_history = model.matches_per_team.get(home_id, 0)
+        away_history = model.matches_per_team.get(away_id, 0)
+        # Knockout tournaments have fewer matches per team than leagues. Use a
+        # lower floor only for those competitions, with multi-season history.
+        required_history = min(MIN_TEAM_HISTORY, 4) if code in TOURNAMENT_COMPETITIONS else MIN_TEAM_HISTORY
+        if min(home_history, away_history) < required_history:
+            logger.warning(
+                f"[ANALYST] {label}: only {home_history}/{away_history} historical matches; "
+                f"minimum is {required_history}."
+            )
+            continue
+
+        odds = match.get("odds_snapshot", {}) or {}
+        market_1x2, overround_1x2 = _complete_market(odds, ("home_win", "draw", "away_win"))
+        market_totals, overround_totals = _complete_market(odds, ("over25", "under25"))
+        market_btts, overround_btts = _complete_market(odds, ("btts_yes", "btts_no"))
+        market_probabilities = {**market_1x2, **market_totals, **market_btts}
+        if market_1x2:
+            market_probabilities["double_chance_home"] = market_1x2["home_win"] + market_1x2["draw"]
+            market_probabilities["double_chance_away"] = market_1x2["away_win"] + market_1x2["draw"]
+            non_draw = max(market_1x2["home_win"] + market_1x2["away_win"], 1e-12)
+            market_probabilities["draw_no_bet_home"] = market_1x2["home_win"] / non_draw
+            market_probabilities["draw_no_bet_away"] = market_1x2["away_win"] / non_draw
+
+        blended = blend_probabilities(model_markets, market_1x2, POISSON_MARKET_WEIGHT)
+        _blend_two_way(blended, market_totals, "over25", "under25")
+        _blend_two_way(blended, market_btts, "btts_yes", "btts_no")
+
+        recent_form = match.get("recent_form") or {}
+        standings = match.get("standings") or {}
+        feature_snapshot = {
+            "model_version": MODEL_VERSION,
+            "competition_code": code,
+            "training_matches": model.training_matches,
+            "home_team_history": home_history,
+            "away_team_history": away_history,
+            "minimum_team_history": required_history,
+            "time_decay_days": model.time_decay_days,
+            "low_score_rho": round(model.rho, 6),
+            "home_advantage_log": round(model.home_advantage, 6),
+            "expected_home_goals": round(model_markets["expected_home_goals"], 4),
+            "expected_away_goals": round(model_markets["expected_away_goals"], 4),
+            "market_weight": POISSON_MARKET_WEIGHT,
+            "market_1x2_overround": overround_1x2,
+            "totals_overround": overround_totals,
+            "btts_overround": overround_btts,
+            "odds_source": match.get("odds_source"),
+            "odds_bookmakers": match.get("odds_bookmakers", []),
+            "odds_last_update": match.get("odds_last_update"),
+            "price_sources": odds.get("_price_sources", {}),
+            "probability_calibration": poisson_context.get("calibration", {"active": False}),
         }
-
-        max_tokens = min(
-            ANALYST_TOKENS_PER_MATCH * len(batch) + 500,
-            ANALYST_TRUNCATION_CEILING,
+        item = {
+            **match,
+            "fixture_id": match.get("fixture_id"),
+            "home_team": match.get("home_team"),
+            "away_team": match.get("away_team"),
+            "home_team_id": home_id,
+            "away_team_id": away_id,
+            "league": match.get("league"),
+            "markets": {key: round(float(value), 6) for key, value in blended.items()},
+            "poisson_markets": {
+                key: round(float(value), 6) for key, value in model_markets.items()
+            },
+            "market_probabilities": market_probabilities,
+            "model_version": MODEL_VERSION,
+            "probability_calibration": poisson_context.get("calibration", {"active": False}),
+            "feature_snapshot": feature_snapshot,
+            "model_confidence": round(max(blended[key] for key in ("home_win", "draw", "away_win")), 4),
+            "supporting_stats": {
+                "home_form": str((recent_form.get("home") or {}).get("results", "UNKNOWN")),
+                "away_form": str((recent_form.get("away") or {}).get("results", "UNKNOWN")),
+                "head_to_head": str(match.get("head_to_head") or "UNKNOWN"),
+                "standings_gap": str(standings or "UNKNOWN"),
+                "key_injuries": str(match.get("injuries") or "UNKNOWN"),
+            },
+            "key_factors": [
+                f"Expected goals: {model_markets['expected_home_goals']:.2f}-{model_markets['expected_away_goals']:.2f}",
+                f"Time-weighted history: {model.training_matches} league matches",
+                f"Team history: {home_history} home / {away_history} away team matches",
+                f"Market shrinkage weight: {POISSON_MARKET_WEIGHT:.0%} where complete prices exist",
+            ],
+            "confidence_calculation": [
+                "Dixon-Coles attack/defence ratings fitted by time-weighted maximum likelihood.",
+                "Low-score adjustment and normalized 0-0 through 10-10 score matrix applied.",
+                "Confidence is the largest blended 1X2 probability, not a win guarantee.",
+            ],
+            "odds_snapshot": odds,
+        }
+        probabilities.append(item)
+        logger.info(
+            f"[ANALYST] {label}: xG {model_markets['expected_home_goals']:.2f}-"
+            f"{model_markets['expected_away_goals']:.2f}; 1X2 "
+            f"{blended['home_win']:.3f}/{blended['draw']:.3f}/{blended['away_win']:.3f}."
         )
 
-        try:
-            text = _gemini_chat(
-                max_tokens=max_tokens,
-                truncation_ceiling=ANALYST_TRUNCATION_CEILING,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": ANALYST_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": f"""Estimate probabilities for EACH of the following
-{len(batch)} matches.
-
-Apply the full ANALYST AGENT instructions above to EVERY match independently.
-
-MATCHES:
-{json.dumps(batch, indent=2)}
-
-Return a single JSON object:
-{{"analyses": [ ... ]}}
-
-Return exactly {len(batch)} analysis objects, one for each match.
-Each item must contain:
-{{
-  "fixture_id": int,
-  "home_team": str,
-  "away_team": str,
-  "supporting_stats": {{
-    "home_form": str,
-    "away_form": str,
-    "head_to_head": str,
-    "standings_gap": str,
-    "key_injuries": str
-  }},
-  "markets": {{
-    "home_win": float,
-    "draw": float,
-    "away_win": float,
-    "btts_yes": float,
-    "over15": float,
-    "over25": float,
-    "under45": float,
-    "double_chance_home": float,
-    "double_chance_away": float,
-    "draw_no_bet_home": float,
-    "draw_no_bet_away": float
-  }},
-  "key_factors": [str],
-  "confidence_calculation": [str],
-  "model_confidence": float
-}}""",
-                    },
-                ],
-            )
-
-        except RuntimeError as e:
-            names = [
-                f"{m.get('home_team')} vs {m.get('away_team')}"
-                for m in batch
-            ]
-
-            logger.error(
-                f"[ANALYST] Giving up on batch of {len(batch)} matches "
-                f"({names}) — Gemini unavailable: {e}"
-            )
-            continue
-
-        data = _extract_json(text)
-        analyses = data.get("analyses") if isinstance(data, dict) else None
-
-        if not isinstance(analyses, list) or not analyses:
-            logger.error(
-                f"Analyst batch parse error for {len(batch)} matches "
-                f"(finish_reason={get_last_finish_reason()}): {text[:300]}"
-            )
-            continue
-
-        claimed_ids = {
-            item.get("fixture_id")
-            for item in analyses
-            if isinstance(item, dict)
-            and item.get("fixture_id") in match_lookup
-        }
-
-        unclaimed = [
-            m for m in batch
-            if m.get("fixture_id") not in claimed_ids
-        ]
-
-        seen_fixture_ids = set()
-
-        for item in analyses:
-            if not isinstance(item, dict):
-                continue
-
-            fixture_id = item.get("fixture_id")
-            match = match_lookup.get(fixture_id)
-
-            if match is None:
-                if len(unclaimed) == 1:
-                    match = unclaimed.pop(0)
-                    fixture_id = match.get("fixture_id")
-                else:
-                    logger.error(
-                        f"[ANALYST] Batch item has unrecognized/missing "
-                        f"fixture_id={fixture_id!r}; dropping item."
-                    )
-                    continue
-
-            seen_fixture_ids.add(fixture_id)
-
-            item["fixture_id"] = fixture_id
-            item.setdefault("home_team", match.get("home_team"))
-            item.setdefault("away_team", match.get("away_team"))
-            item["odds_snapshot"] = match.get("odds_snapshot", {})
-            item["league"] = match.get("league")
-            probabilities.append(item)
-
-            if not item.get("confidence_calculation"):
-                logger.warning(
-                    f"[ANALYST] {item.get('home_team')} vs "
-                    f"{item.get('away_team')} returned an empty "
-                    f"confidence_calculation."
-                )
-
-            logger.info(
-                f"[ANALYST] {item.get('home_team')} vs "
-                f"{item.get('away_team')} — "
-                f"model_confidence={item.get('model_confidence')} "
-                f"(calc: {item.get('confidence_calculation')})"
-            )
-
-        missing = [
-            m for m in batch
-            if m.get("fixture_id") not in seen_fixture_ids
-        ]
-
-        if missing:
-            logger.warning(
-                f"[ANALYST] {len(missing)} matches received no result."
-            )
-
     return probabilities
-
 
 def run_risk_filter(
     probabilities: list[dict],
@@ -674,166 +585,308 @@ Return exactly {len(batch)} assessments:
     return safe
 
 
+def _portfolio_utility(selections: list[dict]) -> tuple[float, float, float, float]:
+    """Expected log growth with a capped Kelly stake for the whole ticket."""
+    combined_odds = math.prod(float(sel["odds"]) for sel in selections)
+    joint_probability = math.prod(float(sel["model_prob"]) for sel in selections)
+    expected_value = joint_probability * combined_odds - 1.0
+    net_odds = combined_odds - 1.0
+    if net_odds <= 0 or expected_value < 0:
+        return -math.inf, combined_odds, joint_probability, expected_value
+    kelly_fraction = max(0.0, expected_value / net_odds)
+    stake = min(PORTFOLIO_MAX_STAKE, kelly_fraction)
+    utility = (
+        joint_probability * math.log1p(stake * net_odds)
+        + (1.0 - joint_probability) * math.log1p(-stake)
+    )
+    return utility, combined_odds, joint_probability, expected_value
+
+
 def run_portfolio(safe_matches: list[dict]) -> dict:
-    if len(safe_matches) < 2:
-        return {
-            "decision": "NO_BET",
-            "reason": "Insufficient safe candidates after risk filtering.",
-        }
+    """Build a risk-adjusted portfolio with no mandatory leg/odds ceiling."""
+    candidates = []
+    evaluations = []
 
-    match_lookup = {
-        m.get("fixture_id"): m
-        for m in safe_matches
-    }
-
-    try:
-        text = _gemini_chat(
-            max_tokens=4000,
-            messages=[
-                {
-                    "role": "system",
-                    "content": PORTFOLIO_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Select matches and markets from these safe candidates:\n"
-                        f"{json.dumps(safe_matches, indent=2)}"
-                    ),
-                },
-            ],
-        )
-
-    except RuntimeError as e:
-        logger.error(f"Portfolio agent unavailable: {e}")
-        return {
-            "decision": "NO_BET",
-            "reason": f"Portfolio agent unavailable: {e}",
-        }
-
-    data = _extract_json(text)
-
-    if not data:
-        logger.error(
-            f"Portfolio parse error "
-            f"(finish_reason={get_last_finish_reason()}, "
-            f"content_len={len(text)}): {text[:200]}"
-        )
-
-        reason = (
-            "Portfolio construction failed: model output was cut off "
-            "before completing valid JSON."
-            if get_last_finish_reason() == "length"
-            else "Portfolio construction failed: model returned "
-            "unparseable content."
-        )
-
-        return {
-            "decision": "NO_BET",
-            "reason": reason,
-        }
-
-    if data.get("decision") == "NO_BET":
-        return data
-
-    raw_selections = data.get("selections", [])
-
-    if len(raw_selections) < 2:
-        return {
-            "decision": "NO_BET",
-            "reason": "Portfolio agent selected fewer than 2 matches.",
-        }
-
-    final_selections = []
-    skipped = []
-
-    for sel in raw_selections:
-        fixture_id = sel.get("fixture_id")
-        market = sel.get("market")
-        match = match_lookup.get(fixture_id)
-
-        if not match:
-            skipped.append(
-                f"fixture {fixture_id} not found in safe matches"
-            )
-            continue
-
+    for match in safe_matches:
         odds_snapshot = match.get("odds_snapshot", {}) or {}
-        odds = _derive_odds(market, odds_snapshot)
-
-        if odds is None:
-            skipped.append(
-                f"{match.get('home_team')} vs "
-                f"{match.get('away_team')} ({market}): "
-                "could not derive valid odds"
+        model_markets = match.get("markets") or {}
+        calibration = match.get("probability_calibration") or {"active": False}
+        for market in SUPPORTED_MARKETS:
+            raw_model_prob = model_markets.get(market)
+            model_prob = (
+                calibrate_probability(raw_model_prob, calibration)
+                if raw_model_prob is not None else None
             )
-            continue
-
-        model_prob = (match.get("markets") or {}).get(market)
-
-        if model_prob is None:
-            skipped.append(
-                f"{match.get('home_team')} vs "
-                f"{match.get('away_team')} ({market}): "
-                "no model probability available"
-            )
-            continue
-
-        implied_prob = 1.0 / odds
-        edge = model_prob - implied_prob
-
-        if edge < MIN_EDGE_MARGIN:
-            skipped.append(
-                f"{match.get('home_team')} vs "
-                f"{match.get('away_team')} ({market}): "
-                f"no real edge — model {model_prob:.2f} vs "
-                f"market-implied {implied_prob:.2f} "
-                f"(edge {edge:+.2f} < required "
-                f"{MIN_EDGE_MARGIN:.2f})"
-            )
-            continue
-
-        final_selections.append(
-            {
-                "fixture_id": fixture_id,
+            odds = _derive_odds(market, odds_snapshot)
+            evaluation = {
+                "fixture_id": match.get("fixture_id"),
                 "home_team": match.get("home_team"),
                 "away_team": match.get("away_team"),
                 "league": match.get("league"),
                 "market": market,
-                "odds": odds,
-                "model_prob": round(model_prob, 3),
-                "implied_prob": round(implied_prob, 3),
-                "edge": round(edge, 3),
-                "rationale": sel.get("rationale", ""),
+                "model_version": match.get("model_version", MODEL_VERSION),
+                "calibration_version": calibration.get("version"),
+                "raw_model_prob": raw_model_prob,
+                "model_prob": model_prob,
+                "bookmaker_odds": odds,
+                "market_implied_prob": (match.get("market_probabilities") or {}).get(market),
+                "odds_source": (
+                    "bookmaker" if market in ("home_win", "draw", "away_win", "btts_yes", "over25")
+                    else "derived_from_bookmaker_1x2"
+                ),
+                "feature_snapshot": match.get("feature_snapshot", {}),
+                "eligible": False,
+                "selected": False,
             }
-        )
+            if odds is None or model_prob is None:
+                evaluation["rejection_reason"] = "Missing valid price or model probability."
+                evaluations.append(evaluation)
+                continue
+            try:
+                metrics = value_metrics(float(model_prob), odds)
+            except ValueError as exc:
+                evaluation["rejection_reason"] = str(exc)
+                evaluations.append(evaluation)
+                continue
 
-    if skipped:
-        logger.info(f"[PORTFOLIO] Skipped selections: {skipped}")
+            evaluation.update({
+                "bookmaker_implied_prob": metrics["bookmaker_implied_prob"],
+                "fair_odds": metrics["fair_odds"],
+                "edge": metrics["edge"],
+                "expected_value": metrics["expected_value"],
+            })
+            reasons = []
+            if float(model_prob) < MIN_SELECTION_PROBABILITY:
+                reasons.append(
+                    f"Probability {model_prob:.3f} below {MIN_SELECTION_PROBABILITY:.3f}."
+                )
+            if metrics["expected_value"] < 0:
+                reasons.append(f"Negative expected value {metrics['expected_value']:.3f}.")
+            if metrics["edge"] < MIN_EDGE_MARGIN:
+                reasons.append(
+                    f"Edge {metrics['edge']:.3f} below {MIN_EDGE_MARGIN:.3f}."
+                )
+            evaluation["rejection_reason"] = " ".join(reasons) or None
+            evaluation["eligible"] = not reasons
+            evaluations.append(evaluation)
+            if reasons:
+                continue
 
-    if len(final_selections) < 2:
+            candidate = {
+                "fixture_id": match.get("fixture_id"),
+                "home_team": match.get("home_team"),
+                "away_team": match.get("away_team"),
+                "league": match.get("league"),
+                "market": market,
+                "odds": round(float(odds), 3),
+                "raw_model_prob": float(raw_model_prob),
+                "model_prob": float(model_prob),
+                "implied_prob": metrics["bookmaker_implied_prob"],
+                "market_implied_prob": evaluation["market_implied_prob"],
+                "fair_odds": metrics["fair_odds"],
+                "edge": metrics["edge"],
+                "expected_value": metrics["expected_value"],
+                "model_version": match.get("model_version", MODEL_VERSION),
+                "calibration_version": calibration.get("version"),
+                "feature_snapshot": match.get("feature_snapshot", {}),
+                "odds_source": evaluation["odds_source"],
+            }
+            utility, *_ = _portfolio_utility([candidate])
+            candidate["_single_utility"] = utility
+            candidates.append(candidate)
+
+    # One market per fixture. Beam width bounds memory/CPU only; it does not
+    # bound fixture count, selection count, or combined odds.
+    best_by_fixture = {}
+    for candidate in candidates:
+        current = best_by_fixture.get(candidate["fixture_id"])
+        key = (candidate["_single_utility"], candidate["model_prob"], -candidate["odds"])
+        if current is None or key > current[0]:
+            best_by_fixture[candidate["fixture_id"]] = (key, candidate)
+    candidates = [entry[1] for entry in best_by_fixture.values()]
+    candidates.sort(key=lambda c: c["_single_utility"], reverse=True)
+
+    if not candidates:
         return {
             "decision": "NO_BET",
-            "reason": (
-                "Fewer than 2 selections had derivable odds. "
-                f"Skipped: {skipped}"
-            ),
+            "reason": "No selection passed the probability, price and non-negative-EV gates.",
+            "candidate_evaluations": evaluations,
         }
 
-    final_selections = final_selections[:5]
+    def state_key(state):
+        selections, utility, combined, joint_probability, _ = state
+        return utility, joint_probability, -len(selections), -combined
 
-    combined_odds = 1.0
-    for selection in final_selections:
-        combined_odds *= selection["odds"]
+    # State = (selections, utility, combined odds, joint probability, EV).
+    states = [([], 0.0, 1.0, 1.0, 0.0)]
+    best = None
+    for candidate in candidates:
+        additions = []
+        for state in states:
+            selections = state[0] + [candidate]
+            if MAX_SELECTIONS > 0 and len(selections) > MAX_SELECTIONS:
+                continue
+            combined = state[2] * candidate["odds"]
+            joint_probability = state[3] * candidate["model_prob"]
+            if not math.isfinite(combined) or not math.isfinite(joint_probability):
+                continue
+            if combined < COMBINED_ODDS_MIN:
+                continue
+            if COMBINED_ODDS_MAX > 0 and combined > COMBINED_ODDS_MAX + 1e-9:
+                continue
+            net_odds = combined - 1.0
+            portfolio_ev = joint_probability * combined - 1.0
+            if net_odds <= 0 or portfolio_ev < 0:
+                continue
+            stake = min(PORTFOLIO_MAX_STAKE, max(0.0, portfolio_ev / net_odds))
+            utility = (
+                joint_probability * math.log1p(stake * net_odds)
+                + (1.0 - joint_probability) * math.log1p(-stake)
+            )
+            if not math.isfinite(utility):
+                continue
+            new_state = (selections, utility, combined, joint_probability, portfolio_ev)
+            additions.append(new_state)
+            if len(selections) >= MIN_SELECTIONS:
+                key = state_key(new_state)
+                if best is None or key > best[0]:
+                    best = (key, new_state)
 
+        states.extend(additions)
+        states.sort(key=state_key, reverse=True)
+        # Keep strong states plus representatives of other leg counts so both
+        # shorter and longer portfolios survive for the next iteration.
+        kept = states[:PORTFOLIO_BEAM_WIDTH]
+        covered_lengths = {len(state[0]) for state in kept}
+        for state in states[PORTFOLIO_BEAM_WIDTH:]:
+            length = len(state[0])
+            if length not in covered_lengths:
+                kept.append(state)
+                covered_lengths.add(length)
+            if len(kept) >= PORTFOLIO_BEAM_WIDTH * 2:
+                break
+        states = kept
+
+    if best is None:
+        return {
+            "decision": "NO_BET",
+            "reason": f"No positive-EV combination satisfies {SELECTION_LIMIT_TEXT} and {ODDS_LIMIT_TEXT}.",
+            "candidate_evaluations": evaluations,
+        }
+
+    _, best_state = best
+    selections, _, combined_odds, joint_probability, portfolio_ev = best_state
+    selected_keys = {(s["fixture_id"], s["market"]) for s in selections}
+    for evaluation in evaluations:
+        evaluation["selected"] = (evaluation["fixture_id"], evaluation["market"]) in selected_keys
+
+    for sel in selections:
+        features = sel.get("feature_snapshot") or {}
+        calibrated = (features.get("probability_calibration") or {}).get("active", False)
+        sel["rationale"] = (
+            f"{'Calibrated ' if calibrated else ''}Dixon-Coles probability {sel['model_prob']:.1%}; "
+            f"fair odds {sel['fair_odds']:.2f}; price {sel['odds']:.2f}; EV {sel['expected_value']:+.1%}. "
+            f"Expected goals {features.get('expected_home_goals', 'N/A')}-"
+            f"{features.get('expected_away_goals', 'N/A')} from "
+            f"{features.get('training_matches', 'N/A')} weighted league matches."
+        )
+        sel["implied_prob"] = round(sel["implied_prob"], 6)
+        sel["fair_odds"] = round(sel["fair_odds"], 4)
+        sel["edge"] = round(sel["edge"], 6)
+        sel["expected_value"] = round(sel["expected_value"], 6)
+        sel.pop("_single_utility", None)
+
+    risk_level = "Low" if joint_probability >= 0.45 else "Medium" if joint_probability >= 0.20 else "High"
     return {
-        "selections": final_selections,
+        "selections": selections,
         "combined_odds": round(combined_odds, 2),
-        "portfolio_confidence": data.get("portfolio_confidence"),
-        "rationale": data.get("rationale", ""),
-        "risk_level": data.get("risk_level", "Medium"),
+        "portfolio_confidence": joint_probability,
+        "portfolio_expected_value": portfolio_ev,
+        "model_version": MODEL_VERSION,
+        "rationale": (
+            f"Risk-adjusted {len(selections)}-leg portfolio; no maximum leg count or odds target was imposed. "
+            "Joint probability assumes independence between different fixtures and is an estimate, not a guarantee."
+        ),
+        "risk_level": risk_level,
+        "candidate_evaluations": evaluations,
     }
 
+def _portfolio_for_llm(portfolio: dict) -> dict:
+    """Keep rejected-candidate diagnostics and feature blobs out of LLM prompts."""
+    compact = {key: value for key, value in portfolio.items() if key not in ("candidate_evaluations", "selections")}
+    compact["selections"] = [
+        {
+            key: sel.get(key)
+            for key in (
+                "fixture_id", "home_team", "away_team", "league", "market", "odds",
+                "model_prob", "implied_prob", "fair_odds", "expected_value", "odds_source", "rationale",
+            )
+        }
+        for sel in portfolio.get("selections", [])
+    ]
+    return compact
+
+
+def validate_portfolio(portfolio: dict) -> list[str]:
+    """Hard mathematical/data gates. FORCE_PUBLISH never bypasses these."""
+    errors = []
+    selections = portfolio.get("selections") or []
+    if len(selections) < MIN_SELECTIONS or (MAX_SELECTIONS > 0 and len(selections) > MAX_SELECTIONS):
+        errors.append(f"Selection count {len(selections)} violates {SELECTION_LIMIT_TEXT}.")
+        return errors
+    fixture_ids = [sel.get("fixture_id") for sel in selections]
+    if any(fixture_id is None for fixture_id in fixture_ids) or len(set(fixture_ids)) != len(fixture_ids):
+        errors.append("Every selection needs a fixture ID and only one market per fixture is allowed.")
+    try:
+        combined = math.prod(float(sel.get("odds")) for sel in selections)
+    except (TypeError, ValueError):
+        return errors + ["Invalid decimal odds in portfolio."]
+    if not math.isfinite(combined) or combined < COMBINED_ODDS_MIN:
+        errors.append(f"Combined odds {combined} are invalid or below {COMBINED_ODDS_MIN:.2f}.")
+    if COMBINED_ODDS_MAX > 0 and combined > COMBINED_ODDS_MAX + 1e-9:
+        errors.append(f"Combined odds {combined:.4f} exceed configured maximum {COMBINED_ODDS_MAX:.2f}.")
+    try:
+        reported_combined = float(portfolio.get("combined_odds"))
+        if abs(reported_combined - combined) > 0.011:
+            errors.append(
+                f"Reported combined odds {reported_combined} do not match selection product {combined:.4f}."
+            )
+    except (TypeError, ValueError):
+        errors.append("Portfolio is missing valid reported combined odds.")
+    for sel in selections:
+        try:
+            probability = float(sel.get("model_prob"))
+            odds = float(sel.get("odds"))
+            metrics = value_metrics(probability, odds)
+        except (TypeError, ValueError):
+            errors.append(f"Invalid probability/odds for fixture {sel.get('fixture_id')}.")
+            continue
+        if sel.get("market") not in SUPPORTED_MARKETS:
+            errors.append(f"Unsupported market {sel.get('market')}.")
+        if not str(sel.get("model_version", "")).startswith("dixon_coles_"):
+            errors.append(f"Fixture {sel.get('fixture_id')} lacks Dixon-Coles model metadata.")
+        features = sel.get("feature_snapshot") or {}
+        if not features:
+            errors.append(f"Fixture {sel.get('fixture_id')} lacks model feature metadata.")
+        else:
+            try:
+                training_matches = int(features.get("training_matches", 0))
+                home_history = int(features.get("home_team_history", 0))
+                away_history = int(features.get("away_team_history", 0))
+                required_history = int(features.get("minimum_team_history", MIN_TEAM_HISTORY))
+                if training_matches < 24 or min(home_history, away_history) < required_history:
+                    errors.append(f"Fixture {sel.get('fixture_id')} has insufficient model history.")
+            except (TypeError, ValueError):
+                errors.append(f"Fixture {sel.get('fixture_id')} has invalid model history metadata.")
+        if sel.get("odds_source") not in ("bookmaker", "derived_from_bookmaker_1x2"):
+            errors.append(f"Fixture {sel.get('fixture_id')} lacks a valid odds source.")
+        if probability < MIN_SELECTION_PROBABILITY:
+            errors.append(f"Fixture {sel.get('fixture_id')} probability below safety minimum.")
+        if metrics["expected_value"] < -1e-9:
+            errors.append(f"Fixture {sel.get('fixture_id')} has negative expected value.")
+        if metrics["edge"] < MIN_EDGE_MARGIN - 1e-9:
+            errors.append(f"Fixture {sel.get('fixture_id')} is below the minimum edge.")
+    return errors
 
 def run_auditor(portfolio: dict) -> dict:
     if portfolio.get("decision") == "NO_BET":
@@ -856,7 +909,7 @@ def run_auditor(portfolio: dict) -> dict:
                     "role": "user",
                     "content": (
                         "Challenge this ticket:\n"
-                        f"{json.dumps(portfolio, indent=2)}"
+                        f"{json.dumps(_portfolio_for_llm(portfolio), indent=2)}"
                     ),
                 },
             ],
@@ -901,6 +954,15 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
             "final_confidence": 0.0,
         }
 
+    hard_errors = validate_portfolio(portfolio)
+    if hard_errors:
+        logger.error(f"[DECISION] Hard portfolio validation failed: {hard_errors}")
+        return {
+            "decision": "NO_BET",
+            "reason": "Hard portfolio validation failed: " + " ".join(hard_errors),
+            "final_confidence": 0.0,
+        }
+
     if FORCE_PUBLISH and portfolio.get("selections"):
         try:
             confidence = float(
@@ -941,7 +1003,7 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
                 {
                     "role": "user",
                     "content": (
-                        f"Portfolio: {json.dumps(portfolio)}\n"
+                        f"Portfolio: {json.dumps(_portfolio_for_llm(portfolio))}\n"
                         f"Audit: {json.dumps(audited)}\n"
                         "Make the final decision."
                     ),
@@ -973,7 +1035,6 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
         }
 
     final_confidence = data.get("final_confidence")
-    combined_odds = portfolio.get("combined_odds")
 
     if (
         final_confidence is not None
@@ -996,32 +1057,35 @@ def run_decision(audited: dict, portfolio: dict) -> dict:
                 f"Original reasoning: {data.get('reason', '')}"
             )
 
-    if (
-        combined_odds is not None
-        and not (
-            COMBINED_ODDS_MIN
-            <= combined_odds
-            <= COMBINED_ODDS_MAX
-        )
-    ):
-        if data.get("decision") == "PUBLISH":
-            logger.warning(
-                "[DECISION] Overriding LLM PUBLISH to NO_BET: "
-                f"combined_odds={combined_odds} outside "
-                f"{COMBINED_ODDS_MIN:.1f}-"
-                f"{COMBINED_ODDS_MAX:.1f}"
-            )
-
-        data["decision"] = "NO_BET"
-        data["reason"] = (
-            f"Overridden to NO_BET: combined_odds "
-            f"({combined_odds}) is outside the required "
-            f"{COMBINED_ODDS_MIN:.1f}-"
-            f"{COMBINED_ODDS_MAX:.1f} range. "
-            f"Original reasoning: {data.get('reason', '')}"
-        )
 
     return data
+
+
+def _plain_published_ticket(portfolio: dict, decision: dict, target_date: str, note: str = "") -> str:
+    selections_text = "\n\n".join(
+        f"MATCH: {s.get('home_team')} vs {s.get('away_team')} ({s.get('league')})\n"
+        f"Market: {s.get('market')}\nOdds: {s.get('odds')}\n"
+        f"Reason: {s.get('rationale', '')}"
+        for s in portfolio.get("selections", [])
+    )
+    return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔵 FOOTBALL PULSE AI
+📅 {target_date}  |  🕗 08:00 EAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Joint probability estimate: {decision.get('final_confidence', 'N/A')}
+⚠️  Overall Risk: {portfolio.get('risk_level', 'N/A')}
+{note}
+
+{selections_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 Combined Odds: {portfolio.get('combined_odds', 'N/A')}
+
+⚠️  DISCLAIMER
+This is a probabilistic model output. No prediction is guaranteed.
+Bet only what you can afford to lose.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 
 def run_publisher(
@@ -1046,9 +1110,15 @@ The system found no selections meeting the
 Discipline over volume. We wait.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
+    if len(portfolio.get("selections", [])) > 12:
+        return _plain_published_ticket(
+            portfolio, decision, target_date,
+            "Full portfolio formatted deterministically so no selection is truncated.",
+        )
+
     try:
         return _gemini_chat(
-            max_tokens=1200,
+            max_tokens=min(8000, max(1200, 500 + 300 * len(portfolio.get("selections", [])))),
             messages=[
                 {
                     "role": "system",
@@ -1059,7 +1129,7 @@ Discipline over volume. We wait.
                     "content": f"""Format the final ticket.
 
 Date: {target_date}
-Portfolio: {json.dumps(portfolio)}
+Portfolio: {json.dumps(_portfolio_for_llm(portfolio))}
 Decision: {json.dumps(decision)}
 Audited: {json.dumps(audited)}""",
                 },
@@ -1068,28 +1138,6 @@ Audited: {json.dumps(audited)}""",
 
     except RuntimeError as e:
         logger.error(f"Publisher agent unavailable: {e}")
-
-        selections_text = "\n".join(
-            f"MATCH: {s.get('home_team')} vs "
-            f"{s.get('away_team')} ({s.get('league')})\n"
-            f"Market: {s.get('market')}\n"
-            f"Odds: {s.get('odds')}\n"
-            f"Reason: {s.get('rationale', '')}"
-            for s in portfolio.get("selections", [])
+        return _plain_published_ticket(
+            portfolio, decision, target_date, "Publisher agent unavailable; using plain fallback."
         )
-
-        return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔵 FOOTBALL PULSE AI
-📅 {target_date}  |  🕗 08:00 EAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 Confidence: {decision.get('final_confidence', 'N/A')}
-⚠️  Overall Risk: {portfolio.get('risk_level', 'N/A')}
-
-Publisher agent unavailable. Plain fallback summary:
-
-{selections_text}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 Combined Odds: {portfolio.get('combined_odds', 'N/A')}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""

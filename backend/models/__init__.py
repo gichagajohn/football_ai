@@ -1,0 +1,1 @@
+"""Deterministic football probability models."""

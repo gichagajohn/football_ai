@@ -10,7 +10,7 @@ import os
 import re
 import time
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 
@@ -20,11 +20,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LEAGUE_IDS = {
     "PL": "Premier League",
+    "ELC": "Championship (England)",
+    "FAC": "FA Cup",
     "PD": "La Liga",
+    "CDR": "Copa del Rey",
     "BL1": "Bundesliga",
+    "DFB": "DFB-Pokal",
     "SA": "Serie A",
+    "CIT": "Coppa Italia",
     "FL1": "Ligue 1",
+    "DED": "Eredivisie",
+    "PPL": "Primeira Liga",
+    "BSA": "Campeonato Brasileiro Série A",
     "CL": "UEFA Champions League",
+    "EL": "UEFA Europa League",
+    "UCL": "UEFA Conference League",
 }
 
 KNOWN_LEAGUE_NAMES = {
@@ -39,12 +49,37 @@ KNOWN_LEAGUE_NAMES = {
 
 ODDS_SPORT_KEYS = {
     "PL": "soccer_epl",
+    "ELC": "soccer_efl_champ",
+    "FAC": "soccer_england_fa_cup",
     "PD": "soccer_spain_la_liga",
+    "CDR": "soccer_spain_copa_del_rey",
     "BL1": "soccer_germany_bundesliga",
+    "DFB": "soccer_germany_dfb_pokal",
     "SA": "soccer_italy_serie_a",
+    "CIT": "soccer_italy_coppa_italia",
     "FL1": "soccer_france_ligue_one",
+    "DED": "soccer_netherlands_eredivisie",
+    "PPL": "soccer_portugal_primeira_liga",
+    "BSA": "soccer_brazil_campeonato",
     "CL": "soccer_uefa_champs_league",
+    "EL": "soccer_uefa_europa_league",
+    "UCL": "soccer_uefa_europa_conference_league",
 }
+
+ODDS_SPORT_ALIASES = {
+    "ELC": ["soccer_efl_champ", "soccer_england_championship"],
+    "FAC": ["soccer_england_fa_cup", "soccer_fa_cup"],
+    "CDR": ["soccer_spain_copa_del_rey", "soccer_copa_del_rey"],
+    "DFB": ["soccer_germany_dfb_pokal", "soccer_dfb_pokal"],
+    "CIT": ["soccer_italy_coppa_italia", "soccer_coppa_italia"],
+    "DED": ["soccer_netherlands_eredivisie", "soccer_eredivisie"],
+    "PPL": ["soccer_portugal_primeira_liga", "soccer_primeira_liga"],
+    "BSA": ["soccer_brazil_campeonato", "soccer_brazil_serie_a"],
+    "CL": ["soccer_uefa_champs_league", "soccer_uefa_champions_league"],
+    "EL": ["soccer_uefa_europa_league", "soccer_europa_league"],
+    "UCL": ["soccer_uefa_europa_conference_league", "soccer_uefa_conference_league"],
+}
+
 
 FPL_NAME_ALIASES = {
     "Nott'm Forest": "Nottingham Forest",
@@ -224,7 +259,7 @@ def _load_league_ids() -> dict[str, str]:
         return DEFAULT_LEAGUE_IDS
     codes = [part.strip().upper() for part in override.split(",") if part.strip()]
     if not codes:
-        logger.warning("[SCOUT] LEAGUE_IDS was set but contained no valid codes — falling back to default top-5+UCL.")
+        logger.warning("[SCOUT] LEAGUE_IDS was set but contained no valid codes — falling back to the configured multi-competition set.")
         return DEFAULT_LEAGUE_IDS
     result = {c: KNOWN_LEAGUE_NAMES.get(c, f"Competition {c}") for c in codes}
     logger.info(f"[SCOUT] LEAGUE_IDS override active — using {len(result)} competition(s): {list(result.values())}")
@@ -247,8 +282,7 @@ def _float_env(name: str, default: float) -> float:
 
 
 CLEANER_THRESHOLD_ENV = _float_env("CLEANER_THRESHOLD", 0.5)
-MAX_MATCHES_PER_DAY = 12
-FALLBACK_BATCH_SIZE = 6
+SCOUT_BATCH_SIZE = max(1, int(os.environ.get("SCOUT_BATCH_SIZE", "12")))
 
 SYSTEM_PROMPT = """You are the SCOUT AGENT for Football Pulse AI.
 Your job is to gather and structure football match intelligence.
@@ -386,10 +420,13 @@ async def fetch_team_recent_form(http: httpx.AsyncClient, team_id: int) -> dict:
         logger.warning(f"[SCOUT] Recent-form fetch failed for team {team_id}: {e}")
         return {}
 
+    matches.sort(key=lambda m: m.get("utcDate") or "", reverse=True)
+
     if len(matches) < 3:
         try:
-            from datetime import date as _d
-            last_season = _d.today().year - 1
+            today = date.today()
+            current_season = today.year if today.month >= 7 else today.year - 1
+            last_season = current_season - 1
             data2 = await _fd_get(
                 http,
                 f"{FOOTBALL_DATA_BASE}/teams/{team_id}/matches",
@@ -469,13 +506,12 @@ async def fetch_fixtures(target_date: date) -> list[dict]:
     async with httpx.AsyncClient(timeout=30) as http:
         for code, league_name in TOP_LEAGUE_IDS.items():
             try:
-                resp = await http.get(
+                data = await _fd_get(
+                    http,
                     f"{FOOTBALL_DATA_BASE}/competitions/{code}/matches",
-                    headers={"X-Auth-Token": os.environ.get("FOOTBALL_DATA_KEY", "")},
                     params={"dateFrom": date_str, "dateTo": date_str},
                 )
-                resp.raise_for_status()
-                matches = resp.json().get("matches", [])
+                matches = data.get("matches", [])
                 for m in matches:
                     m["_competition_code"] = code
                 if matches:
@@ -483,8 +519,41 @@ async def fetch_fixtures(target_date: date) -> list[dict]:
                 all_matches.extend(matches)
             except Exception as e:
                 logger.warning(f"[SCOUT] Fixture fetch failed for {league_name}: {e}")
-            await asyncio.sleep(1)
     return all_matches
+
+
+async def resolve_odds_sport_keys(competition_codes: set[str]) -> dict[str, str]:
+    """Resolve provider keys from its live catalog, with safe static fallback."""
+    fallback = {code: ODDS_SPORT_KEYS[code] for code in competition_codes if code in ODDS_SPORT_KEYS}
+    async with httpx.AsyncClient(timeout=20) as http:
+        try:
+            resp = await http.get(
+                "https://api.the-odds-api.com/v4/sports",
+                params={"apiKey": os.environ.get("ODDS_API_KEY", ""), "all": "true"},
+            )
+            resp.raise_for_status()
+            sports = resp.json()
+            available = {
+                row.get("key") for row in sports
+                if isinstance(row, dict) and row.get("key")
+            } if isinstance(sports, list) else set()
+            if not available:
+                return fallback
+            resolved = {}
+            for code in sorted(competition_codes):
+                candidates = [ODDS_SPORT_KEYS.get(code), *ODDS_SPORT_ALIASES.get(code, [])]
+                match = next((key for key in candidates if key and key in available), None)
+                if match:
+                    resolved[code] = match
+                elif code in fallback:
+                    # Keep backward compatibility if the catalog uses a new
+                    # key not yet present in our aliases; the odds call will
+                    # fail safely and be logged without stopping other leagues.
+                    resolved[code] = fallback[code]
+            return resolved
+        except Exception as exc:
+            logger.warning(f"[SCOUT] Sport-catalog lookup failed; using configured keys: {exc}")
+            return fallback
 
 
 async def fetch_league_odds(sport_key: str) -> list[dict]:
@@ -495,7 +564,7 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
                 params={
                     "apiKey": os.environ.get("ODDS_API_KEY", ""),
                     "regions": "eu",
-                    "markets": "h2h,totals",
+                    "markets": "h2h,totals,btts",
                     "oddsFormat": "decimal",
                 },
             )
@@ -676,27 +745,59 @@ def _match_strong(a: str, b: str) -> bool:
 
 
 def _extract_odds_snapshot(odds_event: dict) -> dict:
-    snapshot = {}
-    bookmakers = odds_event.get("bookmakers", [])
-    if not bookmakers:
-        return snapshot
-    book = bookmakers[0]
+    """Extract the best available price for each outcome across bookmakers."""
+    snapshot: dict = {}
+    price_sources: dict[str, dict] = {}
     home_team = odds_event.get("home_team")
     away_team = odds_event.get("away_team")
-    for market in book.get("markets", []):
-        if market.get("key") == "h2h":
+
+    def offer(market_key: str, outcome: dict, book: dict) -> None:
+        try:
+            price = float(outcome.get("price"))
+        except (TypeError, ValueError):
+            return
+        if not 1.01 <= price <= 1000:
+            return
+        previous = snapshot.get(market_key)
+        if previous is not None and price <= previous:
+            return
+        snapshot[market_key] = price
+        bookmaker = book.get("title") or book.get("key") or "unknown"
+        price_sources[market_key] = {
+            "bookmaker": bookmaker,
+            "price": price,
+            "last_update": outcome.get("last_update") or book.get("last_update"),
+        }
+
+    for book in odds_event.get("bookmakers", []):
+        for market in book.get("markets", []):
+            key = market.get("key")
             for outcome in market.get("outcomes", []):
                 name = outcome.get("name", "")
-                if name == home_team:
-                    snapshot["home_win"] = outcome.get("price")
-                elif name == away_team:
-                    snapshot["away_win"] = outcome.get("price")
-                elif name.lower() == "draw":
-                    snapshot["draw"] = outcome.get("price")
-        elif market.get("key") == "totals":
-            for outcome in market.get("outcomes", []):
-                if outcome.get("point") == 2.5 and outcome.get("name", "").lower() == "over":
-                    snapshot["over25"] = outcome.get("price")
+                if key == "h2h":
+                    if name == home_team:
+                        offer("home_win", outcome, book)
+                    elif name == away_team:
+                        offer("away_win", outcome, book)
+                    elif name.lower() == "draw":
+                        offer("draw", outcome, book)
+                elif key == "totals" and outcome.get("point") == 2.5:
+                    if name.lower() == "over":
+                        offer("over25", outcome, book)
+                    elif name.lower() == "under":
+                        offer("under25", outcome, book)
+                elif key == "btts":
+                    if name.lower() == "yes":
+                        offer("btts_yes", outcome, book)
+                    elif name.lower() == "no":
+                        offer("btts_no", outcome, book)
+
+    if snapshot:
+        updates = [v.get("last_update") for v in price_sources.values() if v.get("last_update")]
+        snapshot["_bookmakers"] = sorted({v["bookmaker"] for v in price_sources.values()})
+        snapshot["_price_sources"] = price_sources
+        snapshot["_last_update"] = max(updates) if updates else None
+        snapshot["_source"] = "the-odds-api"
     return snapshot
 
 
@@ -738,15 +839,24 @@ def _lookup_epl_injuries(injuries_by_team: dict, fd_team_name: str) -> list[dict
     return []
 
 
-async def fetch_weather(venue_city: str | None) -> dict:
+async def fetch_weather(venue_city: str | None, kickoff_utc: str | None = None) -> dict:
+    unknown = {"temp_c": None, "wind_kmh": None, "rain_probability": None, "conditions": "unknown"}
     if not venue_city:
         logger.info("[SCOUT] No venue city — skipping weather fetch.")
-        return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
+        return unknown
 
+    kickoff = None
+    if kickoff_utc:
+        try:
+            kickoff = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            logger.warning(f"[SCOUT] Invalid kickoff for weather lookup: {kickoff_utc}")
+
+    endpoint = "forecast" if kickoff else "weather"
     async with httpx.AsyncClient(timeout=10) as http:
         try:
             resp = await http.get(
-                "https://api.openweathermap.org/data/2.5/weather",
+                f"https://api.openweathermap.org/data/2.5/{endpoint}",
                 params={
                     "q": venue_city,
                     "appid": os.environ.get("OPENWEATHER_KEY", ""),
@@ -755,20 +865,39 @@ async def fetch_weather(venue_city: str | None) -> dict:
             )
             resp.raise_for_status()
             data = resp.json()
+            is_forecast = endpoint == "forecast" and bool(data.get("list"))
+            if is_forecast:
+                # OpenWeather's free forecast has three-hour slots. Use the
+                # slot nearest kickoff instead of presenting current weather
+                # as tomorrow's match conditions.
+                point = min(
+                    data["list"],
+                    key=lambda row: abs(datetime.fromtimestamp(row["dt"], tz=timezone.utc) - kickoff),
+                )
+            else:
+                point = data
             weather = {
-                "temp_c": data["main"]["temp"],
-                "wind_kmh": round(data["wind"]["speed"] * 3.6, 1),
-                "rain_probability": data.get("rain", {}).get("1h", 0),
-                "conditions": data["weather"][0]["description"],
+                "temp_c": (point.get("main") or {}).get("temp"),
+                "wind_kmh": round(float((point.get("wind") or {}).get("speed", 0)) * 3.6, 1),
+                "rain_probability": (
+                    round(float(point.get("pop", 0)) * 100, 1) if is_forecast else None
+                ),
+                "conditions": ((point.get("weather") or [{}])[0]).get("description", "unknown"),
+                "is_forecast": is_forecast,
+                "forecast_time": point.get("dt_txt") if is_forecast else None,
+                "requested_kickoff_utc": kickoff_utc,
             }
+            if not is_forecast:
+                weather["rain_mm_1h"] = (point.get("rain") or {}).get("1h", 0)
             logger.info(
                 f"[SCOUT] Weather for {venue_city}: {weather['conditions']}, "
-                f"{weather['temp_c']}°C, wind {weather['wind_kmh']} km/h"
+                f"{weather['temp_c']}°C, wind {weather['wind_kmh']} km/h, "
+                f"forecast={is_forecast}."
             )
             return weather
         except Exception as e:
             logger.warning(f"[SCOUT] Weather fetch failed for {venue_city}: {e}")
-            return {"temp_c": None, "wind_kmh": None, "rain_probability": 0, "conditions": "unknown"}
+            return unknown
 
 
 def _extract_json(text: str) -> dict:
@@ -864,9 +993,10 @@ Return a JSON object with this structure (and nothing else):
     return result
 
 
-MIN_QUALIFYING_MATCHES = 2
 QUALIFYING_COMPLETENESS = CLEANER_THRESHOLD_ENV
-HARD_CAP_MATCHES = 18
+# Zero means analyze every returned fixture. An optional positive value remains
+# available as an emergency quota control, but production defaults to unlimited.
+HARD_CAP_MATCHES = max(0, int(os.environ.get("SCOUT_HARD_CAP_MATCHES", "0")))
 
 
 async def _deep_analyze(
@@ -885,9 +1015,9 @@ async def _deep_analyze(
     away_id = fixture.get("awayTeam", {}).get("id")
 
     venue_city = (
-        fixture.get("venue")
+        _get_venue_city(home_name)
         or fixture.get("homeTeam", {}).get("venue")
-        or _get_venue_city(home_name)
+        or fixture.get("venue")
     )
     if venue_city:
         logger.info(f"[SCOUT] Venue city for {home_name}: {venue_city}")
@@ -902,7 +1032,7 @@ async def _deep_analyze(
         home_injuries = _lookup_epl_injuries(epl_injuries, home_name)
         away_injuries = _lookup_epl_injuries(epl_injuries, away_name)
 
-    weather = await fetch_weather(venue_city)
+    weather = await fetch_weather(venue_city, fixture.get("utcDate"))
 
     if ENABLE_REAL_FORM_DATA:
         if competition_code and competition_code not in standings_cache:
@@ -997,9 +1127,27 @@ async def _deep_analyze(
             )
             structured["data_completeness"] = floor
 
-    structured.setdefault("fixture_id", fixture_id)
-    if not structured.get("odds_snapshot") and odds_snapshot:
-        structured["odds_snapshot"] = odds_snapshot
+    # Authoritative provider fields always override LLM output. This prevents
+    # plausible but wrong fixture identities, team IDs, kickoff times or odds.
+    structured.update({
+        "fixture_id": fixture_id,
+        "home_team": home_name,
+        "away_team": away_name,
+        "home_team_id": home_id,
+        "away_team_id": away_id,
+        "league": fixture.get("competition", {}).get("name", "Unknown"),
+        "competition_code": competition_code,
+        "kickoff_utc": fixture.get("utcDate"),
+        "odds_snapshot": odds_snapshot,
+        "recent_form": {"home": home_form, "away": away_form},
+        "head_to_head": head_to_head,
+        "standings": {"home": home_standing, "away": away_standing},
+        "injuries": {"home": home_injuries, "away": away_injuries},
+        "weather": weather,
+        "odds_source": odds_snapshot.get("_source"),
+        "odds_bookmakers": odds_snapshot.get("_bookmakers", []),
+        "odds_last_update": odds_snapshot.get("_last_update"),
+    })
 
     logger.info(
         f"[SCOUT] ✓ {structured.get('home_team', '?')} vs {structured.get('away_team', '?')} "
@@ -1025,9 +1173,10 @@ async def run(target_date: date | None = None) -> list[dict]:
     codes_present = {f["_competition_code"] for f in fixtures}
 
     logger.info(f"[SCOUT] Fetching odds for {len(codes_present)} competition(s) with fixtures today...")
+    resolved_sport_keys = await resolve_odds_sport_keys(codes_present)
     odds_by_league: dict[str, list[dict]] = {}
     for code in codes_present:
-        sport_key = ODDS_SPORT_KEYS.get(code)
+        sport_key = resolved_sport_keys.get(code)
         if not sport_key:
             logger.info(f"[SCOUT] No odds source configured for competition {code} — skipping.")
             continue
@@ -1046,51 +1195,48 @@ async def run(target_date: date | None = None) -> list[dict]:
 
     with_odds = [(f, o) for f, o in scanned if o]
     without_odds = [(f, o) for f, o in scanned if not o]
-    prioritized = with_odds + without_odds
+    # Unpriced fixtures cannot pass EV validation, so do not spend form/H2H/
+    # Gemini/API quota on them. All priceable fixtures are still processed.
+    prioritized = with_odds
 
-    logger.info(f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds. Prioritizing those first.")
+    logger.info(
+        f"[SCOUT] {len(with_odds)}/{len(scanned)} fixtures matched to odds; "
+        f"processing every priceable fixture and skipping {len(without_odds)} unpriced fixture(s)."
+    )
 
     results: list[dict] = []
     cursor = 0
-    is_first_batch = True
-
     standings_cache: dict[str, dict] = {}
     team_form_cache: dict[int, dict] = {}
 
     async with httpx.AsyncClient(timeout=20) as fd_http:
-        while cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
-            batch_size = MAX_MATCHES_PER_DAY if is_first_batch else FALLBACK_BATCH_SIZE
-            remaining_budget = HARD_CAP_MATCHES - len(results)
-            batch_size = min(batch_size, remaining_budget)
-
+        while cursor < len(prioritized):
+            if HARD_CAP_MATCHES and len(results) >= HARD_CAP_MATCHES:
+                logger.warning(f"[SCOUT] Optional emergency cap reached at {HARD_CAP_MATCHES} fixtures.")
+                break
+            remaining = HARD_CAP_MATCHES - len(results) if HARD_CAP_MATCHES else SCOUT_BATCH_SIZE
+            batch_size = min(SCOUT_BATCH_SIZE, remaining)
             batch = prioritized[cursor:cursor + batch_size]
             cursor += batch_size
-            is_first_batch = False
 
-            logger.info(f"[SCOUT] Analyzing batch of {len(batch)} fixture(s) (processed so far: {len(results)})...")
-
+            logger.info(
+                f"[SCOUT] Analyzing batch of {len(batch)} fixture(s); "
+                f"{len(results)}/{len(prioritized)} completed."
+            )
             for fixture, odds_event in batch:
                 structured = await _deep_analyze(
                     fixture, odds_event, epl_injuries, fd_http, standings_cache, team_form_cache
                 )
                 results.append(structured)
 
-            qualifying = sum(1 for r in results if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS)
-            logger.info(f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness >= {QUALIFYING_COMPLETENESS}.")
-
-            if qualifying >= MIN_QUALIFYING_MATCHES:
-                logger.info("[SCOUT] Enough qualifying matches found — stopping further batches.")
-                break
-
-            if cursor < len(prioritized) and len(results) < HARD_CAP_MATCHES:
-                logger.info(
-                    f"[SCOUT] Only {qualifying} qualifying match(es) so far (need {MIN_QUALIFYING_MATCHES}). "
-                    f"Pulling one fallback batch automatically..."
-                )
-            else:
-                logger.info(
-                    f"[SCOUT] Only {qualifying} qualifying match(es), but no more fixtures or budget remaining."
-                )
+            qualifying = sum(
+                1 for r in results
+                if r.get("data_completeness", 0) >= QUALIFYING_COMPLETENESS
+            )
+            logger.info(
+                f"[SCOUT] {qualifying}/{len(results)} analyzed matches meet completeness "
+                f">= {QUALIFYING_COMPLETENESS}; continuing until all fixtures are processed."
+            )
 
     logger.info(f"[SCOUT] Collected {len(results)} match intelligence packages total.")
     return results

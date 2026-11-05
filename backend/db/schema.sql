@@ -34,8 +34,40 @@ create table if not exists ticket_selections (
     constraint ticket_selections_unique_pick unique (ticket_date, fixture_id, market)
 );
 
+create table if not exists model_prediction_logs (
+    id bigint generated always as identity primary key,
+    ticket_date date not null,
+    fixture_id bigint not null,
+    home_team text,
+    away_team text,
+    league text,
+    market text not null,
+    model_version text not null,
+    calibration_version text,
+    raw_model_prob double precision,
+    model_prob double precision,
+    market_implied_prob double precision,
+    bookmaker_implied_prob double precision,
+    fair_odds double precision,
+    bookmaker_odds double precision,
+    odds_source text,
+    expected_value double precision,
+    eligible boolean not null default false,
+    selected boolean not null default false,
+    rejection_reason text,
+    feature_snapshot jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    constraint model_prediction_logs_unique unique (ticket_date, fixture_id, market, model_version)
+);
+
 create index if not exists idx_tickets_date on prediction_tickets(ticket_date);
 create index if not exists idx_selections_date on ticket_selections(ticket_date);
+create index if not exists idx_model_logs_date on model_prediction_logs(ticket_date);
+create index if not exists idx_model_logs_selected on model_prediction_logs(selected, ticket_date);
+
+alter table model_prediction_logs enable row level security;
+-- No anon/authenticated policy: detailed features and rejected candidates are
+-- private. GitHub Actions uses the service_role key, which bypasses RLS.
 
 -- For databases created with an older version of this schema, run the
 -- migration in backend/db/migrations/20261104_result_storage_and_dedupe.sql.
@@ -45,7 +77,6 @@ create index if not exists idx_selections_date on ticket_selections(ticket_date)
 -- ============================================================
 -- Row Level Security (RLS)
 -- ============================================================
--- These tables are written to using the service_role key (from GitHub
--- Actions), which bypasses RLS by default. If you also want to read
--- this data from a public dashboard later, enable RLS + add read-only
--- policies for the anon key. For now, RLS stays off for simplicity.
+-- Ticket/selection tables retain their existing public-view setup. The new
+-- model_prediction_logs table above has RLS enabled and no public policy.
+-- All writes use the service_role key from GitHub Actions, which bypasses RLS.

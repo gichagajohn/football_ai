@@ -112,6 +112,10 @@ def store_ticket(
         logger.error(f"[SUPABASE] Failed to store ticket: {e}")
         return
 
+    # Keep model diagnostics separate from the public ticket/selection tables.
+    # A missing optional logging table must never prevent ticket settlement.
+    _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [])
+
     if status != "published":
         return
 
@@ -153,6 +157,53 @@ def store_ticket(
         )
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to store selections: {e}")
+
+
+def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
+    """Persist private model diagnostics without affecting ticket storage."""
+    rows = []
+    for item in evaluations:
+        if item.get("fixture_id") is None or not item.get("market"):
+            continue
+        rows.append({
+            "ticket_date": target_date.isoformat(),
+            "fixture_id": item.get("fixture_id"),
+            "home_team": item.get("home_team"),
+            "away_team": item.get("away_team"),
+            "league": item.get("league"),
+            "market": item.get("market"),
+            "model_version": item.get("model_version") or "unknown",
+            "calibration_version": item.get("calibration_version"),
+            "raw_model_prob": item.get("raw_model_prob"),
+            "model_prob": item.get("model_prob"),
+            "market_implied_prob": item.get("market_implied_prob"),
+            "bookmaker_implied_prob": item.get("bookmaker_implied_prob"),
+            "fair_odds": item.get("fair_odds"),
+            "bookmaker_odds": item.get("bookmaker_odds"),
+            "odds_source": item.get("odds_source"),
+            "expected_value": item.get("expected_value"),
+            "eligible": bool(item.get("eligible")),
+            "selected": bool(item.get("selected")),
+            "rejection_reason": item.get("rejection_reason"),
+            "feature_snapshot": item.get("feature_snapshot") or {},
+        })
+    if not rows:
+        return
+    try:
+        resp = httpx.post(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates, return=minimal"},
+            params={"on_conflict": "ticket_date,fixture_id,market,model_version"},
+            json=rows,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        logger.info(f"[SUPABASE] Stored {len(rows)} model prediction evaluation(s).")
+    except Exception as e:
+        logger.error(
+            f"[SUPABASE] Model logging failed (ticket storage continues): {e}. "
+            "Apply backend/db/migrations/20261104_poisson_prediction_logs.sql."
+        )
 
 
 def get_pending_tickets(before_date: date) -> list[dict]:
@@ -259,6 +310,52 @@ def update_ticket_outcome(ticket_date: date, outcome: str) -> bool:
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to update ticket outcome: {e}")
     return False
+
+
+def get_prediction_logs(limit: int = 10000) -> list[dict]:
+    """Fetch selected private model logs for offline calibration reporting."""
+    if not _enabled():
+        return []
+    try:
+        resp = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers=HEADERS,
+            params={
+                "select": "ticket_date,fixture_id,market,raw_model_prob,model_prob,bookmaker_odds,selected",
+                "selected": "eq.true",
+                "order": "ticket_date.desc",
+                "limit": str(limit),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SUPABASE] Failed to fetch model prediction logs: {e}")
+        return []
+
+
+def get_graded_selections(limit: int = 10000) -> list[dict]:
+    """Fetch settled outcomes used by the offline model calibration report."""
+    if not _enabled():
+        return []
+    try:
+        resp = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/ticket_selections",
+            headers=HEADERS,
+            params={
+                "select": "ticket_date,fixture_id,market,outcome",
+                "outcome": "in.(win,loss)",
+                "order": "ticket_date.desc",
+                "limit": str(limit),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SUPABASE] Failed to fetch graded selections: {e}")
+        return []
 
 
 def get_recent_tickets(limit: int = 30) -> list[dict]:

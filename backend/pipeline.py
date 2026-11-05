@@ -18,6 +18,8 @@ from backend.agents.pipeline_agents import (
     run_publisher,
 )
 from backend.db import supabase_client
+from backend.models.poisson_service import build_poisson_context
+from backend.models.learning import load_probability_calibrator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,12 +77,12 @@ async def run_pipeline(target_date: date | None = None) -> str:
             f"📅 {date_str}  |  🕗 08:00 EAT\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🚫 NO BET TODAY\n\n"
-            f"Reason: No fixtures found in top-5 leagues + UCL for {date_str}.\n\n"
+            f"Reason: No priceable fixtures found in configured competitions for {date_str}.\n\n"
             f"Discipline over volume. We wait.\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         logger.warning(f"NO BET TODAY — Scout found no fixtures for {date_str}.")
-        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "No fixtures found."})
+        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "No priceable fixtures found."})
         return ticket
 
     # ── AGENT 2: CLEANER ─────────────────────────────────────────
@@ -110,12 +112,14 @@ async def run_pipeline(target_date: date | None = None) -> str:
         return ticket
 
     # ── AGENT 3: ANALYST ────────────────────────────────────────
-    logger.info("[3/9] ANALYST AGENT running...")
-    probabilities = run_analyst(clean_matches)
+    logger.info("[3/9] ANALYST fitting historical Dixon-Coles models...")
+    poisson_context = await build_poisson_context(clean_matches, target_date)
+    poisson_context["calibration"] = load_probability_calibrator()
+    probabilities = run_analyst(clean_matches, poisson_context)
     logger.info(f"[3/9] Probabilities computed for {len(probabilities)} matches.")
 
     # ── AGENT 4: CONTEXT (merged into analyst) ──────────────────
-    logger.info("[4/9] CONTEXT AGENT adjustments applied.")
+    logger.info("[4/9] Provider context retained for deterministic risk review.")
 
     # ── AGENT 5: RISK ────────────────────────────────────────────
     logger.info("[5/9] RISK AGENT running...")
