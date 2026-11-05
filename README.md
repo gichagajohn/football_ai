@@ -69,7 +69,11 @@ Every returned fixture with a matched bookmaker event is processed; the old
 because they cannot pass EV validation. Provider competition/odds coverage
 varies by plan and season; failed feeds are logged and skipped safely. The
 Scout queries The Odds API sport catalog and resolves provider-specific key
-aliases dynamically, with configured keys as fallback.
+aliases dynamically, with configured keys as fallback. Cross-provider team
+matching strips diacritics/punctuation, applies explicit aliases, and removes
+only non-identifying whole club tokens; it does not use broad fuzzy matching.
+If a fixture remains unmatched, the log lists its canonical names/kickoff and
+the available provider event names/kickoffs for diagnosis.
 
 Use a comma-separated `LEAGUE_IDS` override to run a subset when quota is
 limited. `SCOUT_HARD_CAP_MATCHES=0` means no fixture cap; a positive value is

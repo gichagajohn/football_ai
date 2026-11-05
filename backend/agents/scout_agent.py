@@ -736,6 +736,41 @@ _TEAM_NAME_ALIASES = {
     "1 fc koln": "1 fc koln",
 }
 
+# Legal/club tokens carry no opponent-identifying information. Removing whole
+# tokens is deliberately conservative: this is not edit-distance or fuzzy
+# matching, and distinctive tokens such as city, "atletico" and "real" remain.
+_GENERIC_TEAM_TOKENS = {
+    "ac", "acf", "afc", "ball", "bc", "bk", "ca", "calcio", "cd", "cf", "cfc",
+    "clube", "club", "cr", "da", "das", "de", "do", "dos", "e", "ec", "esporte",
+    "esportiva", "fbpa", "fc", "fk", "foot", "football", "fr", "fsv", "futebol",
+    "if", "ik", "losc", "og", "ogc", "rc", "regatas", "sc", "sd", "se",
+    "sociedade", "sport", "ss", "ssc", "sv", "tsg", "ud", "vfb", "vfl",
+}
+_TEAM_NAME_ABBREVIATIONS = {
+    "america mg": "america mineiro",
+    "atletico go": "atletico goianiense",
+    "atletico mg": "atletico mineiro",
+    "athletico pr": "athletico paranaense",
+    "corinthians paulista": "corinthians",
+    "gremio porto alegrense": "gremio",
+    "paranaense": "athletico paranaense",
+    "rb bragantino": "red bull bragantino",
+}
+
+
+def _canonical_team_name(name: str) -> str:
+    """Return a conservative cross-provider comparison key for a club name."""
+    normalized = _normalize_team_name(str(name or ""))
+    # Resolve aliases both before and after punctuation normalization so keys
+    # such as "nott'm forest" keep working alongside names such as Atletico-MG.
+    aliased = _TEAM_NAME_ALIASES.get(normalized, normalized)
+    normalized = re.sub(r"[^a-z0-9]+", " ", aliased).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    aliased = _TEAM_NAME_ALIASES.get(normalized, normalized)
+    tokens = [token for token in aliased.split() if token not in _GENERIC_TEAM_TOKENS]
+    canonical = " ".join(tokens) or normalized
+    return _TEAM_NAME_ABBREVIATIONS.get(canonical, canonical)
+
 
 def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
     """Find the odds event matching a fixture.
@@ -744,23 +779,17 @@ def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) ->
     with the *old* normalisation (no diacritics, no leading-prefix strip),
     which is why 'FC Bayern München' never matched 'Bayern Munich' and
     Bayern's odds silently fell off. New approach:
-      1. Strip diacritics + leading prefixes via _normalize_team_name.
-      2. Resolve provider-specific aliases via _TEAM_NAME_ALIASES.
+      1. Strip diacritics/punctuation and resolve explicit club aliases.
+      2. Remove non-identifying whole club tokens and expand exact abbreviations.
       3. Match by exact equality OR substring WITH a length-ratio guard
          (shorter must be >= 50% of the longer) to prevent single-word
          false positives like 'milan' matching inside 'inter milan'.
     """
-    home_canon = _TEAM_NAME_ALIASES.get(_normalize_team_name(home_name), _normalize_team_name(home_name))
-    away_canon = _TEAM_NAME_ALIASES.get(_normalize_team_name(away_name), _normalize_team_name(away_name))
+    home_canon = _canonical_team_name(home_name)
+    away_canon = _canonical_team_name(away_name)
     for event in odds_events:
-        eh = _TEAM_NAME_ALIASES.get(
-            _normalize_team_name(event.get("home_team", "")),
-            _normalize_team_name(event.get("home_team", "")),
-        )
-        ea = _TEAM_NAME_ALIASES.get(
-            _normalize_team_name(event.get("away_team", "")),
-            _normalize_team_name(event.get("away_team", "")),
-        )
+        eh = _canonical_team_name(event.get("home_team", ""))
+        ea = _canonical_team_name(event.get("away_team", ""))
         # home match: equal OR substring with ratio guard (>=50%)
         if not _match_strong(home_canon, eh):
             continue
@@ -782,6 +811,43 @@ def _match_strong(a: str, b: str) -> bool:
     if len(short) < 0.5 * len(long):
         return False
     return short in long
+
+
+def _log_unmatched_odds(
+    competition_code: str,
+    unmatched_fixtures: list[dict],
+    odds_events: list[dict],
+) -> None:
+    """Expose safe names/kickoffs needed to diagnose cross-provider misses."""
+    if not unmatched_fixtures:
+        return
+    if not odds_events:
+        logger.warning(
+            f"[SCOUT] {competition_code}: {len(unmatched_fixtures)} fixture(s) "
+            "remained unpriced because the provider returned zero odds events."
+        )
+        return
+
+    catalog = " | ".join(
+        f"{event.get('home_team', '?')} vs {event.get('away_team', '?')} "
+        f"@ {event.get('commence_time', 'unknown kickoff')}"
+        for event in odds_events[:20]
+    )
+    if len(odds_events) > 20:
+        catalog += f" | ... {len(odds_events) - 20} more event(s)"
+    logger.warning(
+        f"[SCOUT] {competition_code}: provider returned {len(odds_events)} "
+        f"odds event(s), but {len(unmatched_fixtures)} fixture(s) did not match. "
+        f"Provider catalog: {catalog}"
+    )
+    for fixture in unmatched_fixtures:
+        home = (fixture.get("homeTeam") or {}).get("name", "?")
+        away = (fixture.get("awayTeam") or {}).get("name", "?")
+        logger.warning(
+            f"[SCOUT] Unmatched {competition_code} fixture: {home} vs {away} "
+            f"@ {fixture.get('utcDate', 'unknown kickoff')} "
+            f"(canonical: {_canonical_team_name(home)} / {_canonical_team_name(away)})"
+        )
 
 
 def _extract_odds_snapshot(odds_event: dict) -> dict:
@@ -1235,6 +1301,9 @@ async def run(target_date: date | None = None) -> list[dict]:
 
     with_odds = [(f, o) for f, o in scanned if o]
     without_odds = [(f, o) for f, o in scanned if not o]
+    for code in sorted(codes_present):
+        unmatched = [f for f, _ in without_odds if f.get("_competition_code") == code]
+        _log_unmatched_odds(code, unmatched, odds_by_league.get(code, []))
     # Unpriced fixtures cannot pass EV validation, so do not spend form/H2H/
     # Gemini/API quota on them. All priceable fixtures are still processed.
     prioritized = with_odds
