@@ -56,15 +56,23 @@ HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",  # upsert on conflict
 }
 
 
+def storage_configured() -> bool:
+    """Return whether the required Supabase service configuration is present."""
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
 def _enabled() -> bool:
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not storage_configured():
         logger.warning("[SUPABASE] SUPABASE_URL/SUPABASE_KEY not set — skipping storage.")
         return False
     return True
+
+
+class TicketStorageError(RuntimeError):
+    """Raised when the authoritative ticket snapshot could not be stored."""
 
 
 def store_ticket(
@@ -72,57 +80,27 @@ def store_ticket(
     ticket_text: str,
     portfolio: dict,
     decision: dict,
-) -> None:
-    """Store the daily ticket and its selections in Supabase."""
+) -> bool:
+    """Atomically store one complete ticket snapshot in Supabase.
+
+    The database RPC replaces obsolete selections and updates retained odds in
+    the same transaction as the ticket summary. Existing outcomes/scores are
+    never supplied for an upsert, and the RPC rejects rewrites after settlement.
+
+    Returns False only when Supabase is not configured (local/dry runs). Any
+    configured storage failure raises TicketStorageError so daily_run cannot
+    email a ticket that was not safely published to the website.
+    """
     if not _enabled():
-        return
+        return False
 
     status = "published" if decision.get("decision") == "PUBLISH" else "no_bet"
-
-    ticket_row = {
-        "ticket_date": target_date.isoformat(),
-        "status": status,
-        "combined_odds": portfolio.get("combined_odds"),
-        "selection_count": len(portfolio.get("selections", [])),
-        "final_confidence": decision.get("final_confidence"),
-        "risk_level": portfolio.get("risk_level"),
-        "reason": decision.get("reason"),
-        "ticket_text": ticket_text,
-        # Do not send outcome on an upsert. The database default sets new
-        # tickets to 'pending', while omitting it here preserves an already
-        # graded outcome when a daily workflow is rerun for the same date.
-    }
-
-    try:
-        resp = httpx.post(
-            f"{SUPABASE_URL}/rest/v1/prediction_tickets",
-            headers=HEADERS,
-            # "Prefer: resolution=merge-duplicates" alone isn't enough — PostgREST
-            # needs to be told which unique column to treat as the conflict target.
-            # Without this, it falls back to the primary key (id), which is never
-            # present in ticket_row, so it silently attempts a plain INSERT and
-            # then 409s against the ticket_date unique constraint on any re-run.
-            params={"on_conflict": "ticket_date"},
-            json=ticket_row,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        logger.info(f"[SUPABASE] Stored ticket for {target_date} (status={status}).")
-    except Exception as e:
-        logger.error(f"[SUPABASE] Failed to store ticket: {e}")
-        return
-
-    # Keep model diagnostics separate from the public ticket/selection tables.
-    # A missing optional logging table must never prevent ticket settlement.
-    _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [])
-
-    if status != "published":
-        return
-
+    selections = portfolio.get("selections", []) if status == "published" else []
     selection_rows = []
-    for sel in portfolio.get("selections", []):
+    for sel in selections:
+        # Deliberately omit outcome/home_score/away_score. New rows receive the
+        # database default 'pending'; retained rows keep their existing result.
         selection_rows.append({
-            "ticket_date": target_date.isoformat(),
             "fixture_id": sel.get("fixture_id"),
             "home_team": sel.get("home_team"),
             "away_team": sel.get("away_team"),
@@ -130,33 +108,43 @@ def store_ticket(
             "market": sel.get("market"),
             "odds": sel.get("odds"),
             "rationale": sel.get("rationale"),
-            "outcome": "pending",
         })
 
-    if not selection_rows:
-        return
+    payload = {
+        "p_ticket_date": target_date.isoformat(),
+        "p_status": status,
+        "p_combined_odds": portfolio.get("combined_odds") if status == "published" else None,
+        "p_final_confidence": decision.get("final_confidence"),
+        "p_risk_level": portfolio.get("risk_level") if status == "published" else None,
+        "p_reason": decision.get("reason"),
+        "p_ticket_text": ticket_text,
+        "p_selections": selection_rows,
+    }
 
     try:
         resp = httpx.post(
-            f"{SUPABASE_URL}/rest/v1/ticket_selections",
-            # A matching unique index exists on
-            # (ticket_date, fixture_id, market). Ignore an existing selection
-            # rather than inserting a duplicate or resetting its graded result.
-            headers={
-                **HEADERS,
-                "Prefer": "resolution=ignore-duplicates, return=minimal",
-            },
-            params={"on_conflict": "ticket_date,fixture_id,market"},
-            json=selection_rows,
-            timeout=15,
+            f"{SUPABASE_URL}/rest/v1/rpc/store_prediction_ticket",
+            headers=HEADERS,
+            json=payload,
+            timeout=30,
         )
         resp.raise_for_status()
-        logger.info(
-            f"[SUPABASE] Submitted {len(selection_rows)} selection(s); "
-            "existing selections were preserved."
-        )
     except Exception as e:
-        logger.error(f"[SUPABASE] Failed to store selections: {e}")
+        logger.error(f"[SUPABASE] Atomic ticket storage failed for {target_date}: {e}")
+        raise TicketStorageError(
+            f"Could not store the complete ticket for {target_date}; email suppressed."
+        ) from e
+
+    logger.info(
+        f"[SUPABASE] Stored ticket for {target_date} atomically "
+        f"(status={status}, selections={len(selection_rows)})."
+    )
+
+    # Keep model diagnostics separate from the public ticket/selection tables.
+    # A missing optional logging table must never prevent ticket settlement or
+    # suppress an otherwise safely stored ticket email.
+    _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [])
+    return True
 
 
 def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:

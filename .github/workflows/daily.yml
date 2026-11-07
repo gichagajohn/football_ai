@@ -17,6 +17,12 @@ on:
         required: false
         default: ""
 
+# Serialize scheduled and manual production runs. A queued rerun starts only
+# after the active run has stored its snapshot and finished sending its email.
+concurrency:
+  group: football-pulse-daily-production
+  cancel-in-progress: false
+
 jobs:
   daily-prediction:
     runs-on: ubuntu-latest

@@ -127,12 +127,17 @@ existing installation, preserve the earlier result repair and then apply:
 
 ```text
 backend/db/migrations/20261104_poisson_prediction_logs.sql
+backend/db/migrations/20261107_atomic_ticket_storage.sql
 ```
 
-This adds/upgrades private model diagnostics without changing existing tickets,
-selections, or settled scores. It is safe to rerun and includes upgrade columns
-for an earlier version of the prediction-log table. Keep service-role keys
-secret.
+The first adds/upgrades private model diagnostics without changing existing
+tickets, selections, or settled scores. The second installs a service-role-only
+RPC that stores each summary and its complete selection snapshot atomically,
+removes stale rerun legs, refreshes retained odds, and rejects settled-ticket
+rewrites. Apply it before deploying backend code that calls the RPC. Optional
+rollback-only verification is in
+`backend/db/smoke_tests/20261107_atomic_ticket_storage.sql`. Keep service-role
+keys secret.
 
 ### 2. GitHub Secrets
 

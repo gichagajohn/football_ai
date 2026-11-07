@@ -70,9 +70,9 @@ alter table model_prediction_logs enable row level security;
 -- private. GitHub Actions uses the service_role key, which bypasses RLS.
 
 -- For databases created with an older version of this schema, run the
--- migration in backend/db/migrations/20261104_result_storage_and_dedupe.sql.
--- It adds the score columns, removes old duplicates, and creates the matching
--- unique index required by the application's idempotent selection inserts.
+-- migrations in backend/db/migrations/. The 20261104 migration adds result
+-- storage/deduplication. The 20261107 migration installs the service-role-only
+-- store_prediction_ticket RPC used for atomic whole-snapshot publishing.
 
 -- ============================================================
 -- Row Level Security (RLS)
