@@ -157,7 +157,7 @@ Configure these under **Settings → Secrets and variables → Actions**:
 
 ### 3. Run
 
-The daily workflow runs at 08:00 EAT (05:00 UTC), or manually through
+The daily workflow runs at 07:00 EAT (04:00 UTC), or manually through
 **Actions → Football Pulse AI — Daily Ticket → Run workflow**. More competitions,
 all-fixture processing, historical fitting, and provider pacing can make runs
 substantially longer. The timeout is 120 minutes.
@@ -251,7 +251,7 @@ backend/
 
 ## Schedules and quotas
 
-- Daily ticket: 08:00 EAT; result and weekly workflows retain their schedules
+- Daily ticket: 07:00 EAT; result and weekly workflows retain their schedules
   and can also be dispatched manually.
 - football-data.org and The Odds API quotas vary by plan. The Scout caches
   standings/form within a run and the shared football-data client paces and

@@ -131,7 +131,7 @@ Output exactly this format:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔵 FOOTBALL PULSE AI
-📅 {date}  |  🕗 08:00 EAT
+📅 {date}  |  🕗 07:00 EAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📊 Confidence: {confidence}%
@@ -1070,7 +1070,7 @@ def _plain_published_ticket(portfolio: dict, decision: dict, target_date: str, n
     )
     return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔵 FOOTBALL PULSE AI
-📅 {target_date}  |  🕗 08:00 EAT
+📅 {target_date}  |  🕗 07:00 EAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📊 Joint probability estimate: {decision.get('final_confidence', 'N/A')}
@@ -1097,7 +1097,7 @@ def run_publisher(
     if decision.get("decision") == "NO_BET":
         return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔵 FOOTBALL PULSE AI
-📅 {target_date}  |  🕗 08:00 EAT
+📅 {target_date}  |  🕗 07:00 EAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🚫 NO BET TODAY

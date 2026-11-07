@@ -74,7 +74,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
         ticket = (
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔵 FOOTBALL PULSE AI\n"
-            f"📅 {date_str}  |  🕗 08:00 EAT\n"
+            f"📅 {date_str}  |  🕗 07:00 EAT\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🚫 NO BET TODAY\n\n"
             f"Reason: No priceable fixtures found in configured competitions for {date_str}.\n\n"
@@ -99,7 +99,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
         ticket = (
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔵 FOOTBALL PULSE AI\n"
-            f"📅 {date_str}  |  🕗 08:00 EAT\n"
+            f"📅 {date_str}  |  🕗 07:00 EAT\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"🚫 NO BET TODAY\n\n"
             f"Reason: All {len(intelligence)} collected matches failed the data "
