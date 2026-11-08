@@ -11,6 +11,7 @@ def make_match(fixture_id=1, probability=0.70, odds=1.60):
         "home_team": f"Home {fixture_id}",
         "away_team": f"Away {fixture_id}",
         "league": "Test League",
+        "kickoff_utc": "2099-01-07T12:00:00Z",
         "markets": {"home_win": probability},
         "market_probabilities": {"home_win": 1 / odds},
         "odds_snapshot": {"home_win": odds},
@@ -28,6 +29,7 @@ def test_single_strong_selection_is_allowed():
     assert len(portfolio["selections"]) == 1
     assert portfolio["combined_odds"] == pytest.approx(1.60)
     assert portfolio["portfolio_confidence"] == pytest.approx(0.70)
+    assert portfolio["selections"][0]["kickoff_utc"] == "2099-01-07T12:00:00Z"
     assert agents.validate_portfolio(portfolio) == []
 
 

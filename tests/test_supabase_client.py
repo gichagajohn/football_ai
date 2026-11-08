@@ -15,6 +15,7 @@ def selection(fixture_id=12345, market="home_win", odds=2.0):
         "home_team": "Home FC",
         "away_team": "Away FC",
         "league": "Premier League",
+        "kickoff_utc": "2099-01-07T12:00:00Z",
         "market": market,
         "odds": odds,
         "rationale": "Test selection",
@@ -56,6 +57,7 @@ class SupabaseStorageTests(unittest.TestCase):
         self.assertEqual(len(payload["p_selections"]), 2)
         self.assertEqual(payload["p_selections"][1]["odds"], 1.8)
         for row in payload["p_selections"]:
+            self.assertEqual(row["kickoff_utc"], "2099-01-07T12:00:00Z")
             self.assertNotIn("ticket_date", row)
             self.assertNotIn("outcome", row)
             self.assertNotIn("home_score", row)
@@ -165,6 +167,34 @@ class AtomicStorageMigrationTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/daily.yml").read_text()
         self.assertIn("group: football-pulse-daily-production", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
+
+
+class PredictionIntegrityMigrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sql = (ROOT / "backend/db/migrations/20261108_prediction_integrity.sql").read_text()
+
+    def test_versions_are_private_and_legacy_history_is_preserved(self):
+        self.assertIn("create table if not exists public.prediction_ticket_versions", self.sql)
+        self.assertIn("enable row level security", self.sql)
+        self.assertIn("'legacy_unverified'", self.sql)
+        self.assertIn("prediction_ticket_one_current_idx", self.sql)
+        self.assertIn("from public.prediction_tickets t", self.sql)
+        self.assertIn("revoke all on table public.prediction_ticket_versions from anon", self.sql)
+        self.assertIn("revoke all on table public.prediction_ticket_versions from authenticated", self.sql)
+
+    def test_started_and_legacy_selections_cannot_be_rewritten(self):
+        self.assertIn("Selection kickoff_utc is required", self.sql)
+        self.assertIn("if v_kickoff <= now() then", self.sql)
+        self.assertIn("s.kickoff_utc is null or s.kickoff_utc <= now()", self.sql)
+        self.assertIn("prediction publication is locked", self.sql)
+
+    def test_pre_kickoff_reruns_supersede_and_append_versions(self):
+        self.assertIn("set version_status = 'superseded', superseded_at = now()", self.sql)
+        self.assertIn("insert into public.prediction_ticket_versions", self.sql)
+        self.assertIn("'official'", self.sql)
+        self.assertIn("kickoff_utc = excluded.kickoff_utc", self.sql)
+        self.assertNotIn("run_id = excluded.run_id", self.sql)
 
 
 if __name__ == "__main__":

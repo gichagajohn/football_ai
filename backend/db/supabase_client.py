@@ -85,7 +85,9 @@ def store_ticket(
 
     The database RPC replaces obsolete selections and updates retained odds in
     the same transaction as the ticket summary. Existing outcomes/scores are
-    never supplied for an upsert, and the RPC rejects rewrites after settlement.
+    never supplied for an upsert. Every successful publish creates an immutable
+    prediction snapshot, and the RPC rejects selections at/after kickoff or any
+    rewrite after settlement.
 
     Returns False only when Supabase is not configured (local/dry runs). Any
     configured storage failure raises TicketStorageError so daily_run cannot
@@ -105,6 +107,7 @@ def store_ticket(
             "home_team": sel.get("home_team"),
             "away_team": sel.get("away_team"),
             "league": sel.get("league"),
+            "kickoff_utc": sel.get("kickoff_utc"),
             "market": sel.get("market"),
             "odds": sel.get("odds"),
             "rationale": sel.get("rationale"),

@@ -677,6 +677,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 "home_team": match.get("home_team"),
                 "away_team": match.get("away_team"),
                 "league": match.get("league"),
+                "kickoff_utc": match.get("kickoff_utc"),
                 "market": market,
                 "odds": round(float(odds), 3),
                 "raw_model_prob": float(raw_model_prob),

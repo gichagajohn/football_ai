@@ -25,6 +25,7 @@ create table if not exists ticket_selections (
     home_team text,
     away_team text,
     league text,
+    kickoff_utc timestamptz,
     market text,
     odds numeric,
     rationale text,
@@ -71,8 +72,8 @@ alter table model_prediction_logs enable row level security;
 
 -- For databases created with an older version of this schema, run the
 -- migrations in backend/db/migrations/. The 20261104 migration adds result
--- storage/deduplication. The 20261107 migration installs the service-role-only
--- store_prediction_ticket RPC used for atomic whole-snapshot publishing.
+-- storage/deduplication. The 20261107 migration installs atomic whole-snapshot
+-- publishing, and 20261108 adds private immutable versions plus kickoff locks.
 
 -- ============================================================
 -- Row Level Security (RLS)

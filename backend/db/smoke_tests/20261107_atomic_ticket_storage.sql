@@ -22,9 +22,9 @@ begin
         'Smoke test initial snapshot',
         'Initial three-leg ticket',
         '[
-          {"fixture_id":900001,"home_team":"A","away_team":"B","league":"Test","market":"away_win","odds":2.60,"rationale":"initial A"},
-          {"fixture_id":900002,"home_team":"C","away_team":"D","league":"Test","market":"home_win","odds":1.65,"rationale":"retained C"},
-          {"fixture_id":900003,"home_team":"E","away_team":"F","league":"Test","market":"over25","odds":1.52,"rationale":"obsolete E"}
+          {"fixture_id":900001,"home_team":"A","away_team":"B","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"away_win","odds":2.60,"rationale":"initial A"},
+          {"fixture_id":900002,"home_team":"C","away_team":"D","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"home_win","odds":1.65,"rationale":"retained C"},
+          {"fixture_id":900003,"home_team":"E","away_team":"F","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"over25","odds":1.52,"rationale":"obsolete E"}
         ]'::jsonb
     );
 
@@ -43,8 +43,8 @@ begin
         'Smoke test replacement snapshot',
         'Replacement two-leg ticket',
         '[
-          {"fixture_id":900002,"home_team":"C","away_team":"D","league":"Test","market":"home_win","odds":1.86,"rationale":"updated C"},
-          {"fixture_id":900004,"home_team":"G","away_team":"H","league":"Test","market":"draw_no_bet_away","odds":1.365,"rationale":"new G"}
+          {"fixture_id":900002,"home_team":"C","away_team":"D","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"home_win","odds":1.86,"rationale":"updated C"},
+          {"fixture_id":900004,"home_team":"G","away_team":"H","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"draw_no_bet_away","odds":1.365,"rationale":"new G"}
         ]'::jsonb
     );
 
@@ -94,7 +94,7 @@ begin
         'Low',
         'Smoke test settlement setup',
         'One-leg ticket',
-        '[{"fixture_id":900005,"home_team":"I","away_team":"J","league":"Test","market":"home_win","odds":2.0,"rationale":"settle"}]'::jsonb
+        '[{"fixture_id":900005,"home_team":"I","away_team":"J","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"home_win","odds":2.0,"rationale":"settle"}]'::jsonb
     );
     update public.ticket_selections
     set outcome = 'win', home_score = 1, away_score = 0
@@ -109,7 +109,7 @@ begin
             'Low',
             'Must be rejected',
             'Forbidden rewrite',
-            '[{"fixture_id":900006,"home_team":"K","away_team":"L","league":"Test","market":"away_win","odds":2.5,"rationale":"reject"}]'::jsonb
+            '[{"fixture_id":900006,"home_team":"K","away_team":"L","league":"Test","kickoff_utc":"2099-01-07T12:00:00Z","market":"away_win","odds":2.5,"rationale":"reject"}]'::jsonb
         );
         raise exception 'Settled-ticket rewrite was incorrectly allowed';
     exception
