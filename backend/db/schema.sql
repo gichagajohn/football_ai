@@ -42,21 +42,30 @@ create table if not exists model_prediction_logs (
     home_team text,
     away_team text,
     league text,
+    kickoff_utc timestamptz,
     market text not null,
     model_version text not null,
+    strategy text not null default 'production',
+    shadow_selected boolean not null default false,
     calibration_version text,
     raw_model_prob double precision,
     model_prob double precision,
+    robust_model_prob double precision,
     market_implied_prob double precision,
     bookmaker_implied_prob double precision,
     fair_odds double precision,
     bookmaker_odds double precision,
+    closing_bookmaker_odds double precision,
     odds_source text,
     expected_value double precision,
+    robust_expected_value double precision,
     eligible boolean not null default false,
     selected boolean not null default false,
     rejection_reason text,
     feature_snapshot jsonb not null default '{}'::jsonb,
+    outcome text not null default 'pending',
+    home_score smallint,
+    away_score smallint,
     created_at timestamptz not null default now(),
     constraint model_prediction_logs_unique unique (ticket_date, fixture_id, market, model_version)
 );
@@ -65,6 +74,7 @@ create index if not exists idx_tickets_date on prediction_tickets(ticket_date);
 create index if not exists idx_selections_date on ticket_selections(ticket_date);
 create index if not exists idx_model_logs_date on model_prediction_logs(ticket_date);
 create index if not exists idx_model_logs_selected on model_prediction_logs(selected, ticket_date);
+create index if not exists idx_model_logs_shadow_settlement on model_prediction_logs(ticket_date, strategy, shadow_selected, outcome);
 
 alter table model_prediction_logs enable row level security;
 -- No anon/authenticated policy: detailed features and rejected candidates are
@@ -74,6 +84,8 @@ alter table model_prediction_logs enable row level security;
 -- migrations in backend/db/migrations/. The 20261104 migration adds result
 -- storage/deduplication. The 20261107 migration installs atomic whole-snapshot
 -- publishing, and 20261108 adds private immutable versions plus kickoff locks.
+-- The 20261108_portfolio_shadow migration adds private shadow diagnostics,
+-- outcome settlement, and optional closing prices for CLV reports.
 
 -- ============================================================
 -- Row Level Security (RLS)

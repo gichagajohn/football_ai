@@ -24,6 +24,7 @@ from datetime import date
 import httpx
 
 from backend.db import supabase_client
+from backend.models.settlement import grade_market
 
 logger = logging.getLogger(__name__)
 
@@ -144,33 +145,13 @@ def grade_selection(market: str, home_goals: int, away_goals: int) -> str:
     Determine win/loss for a selection given the final score.
     Returns 'win', 'loss', or 'void' (if market can't be graded).
     """
-    total_goals = home_goals + away_goals
-
-    if market == "home_win":
-        return "win" if home_goals > away_goals else "loss"
-    if market == "away_win":
-        return "win" if away_goals > home_goals else "loss"
-    if market == "draw":
-        return "win" if home_goals == away_goals else "loss"
-    if market == "double_chance_home":
-        return "win" if home_goals >= away_goals else "loss"
-    if market == "double_chance_away":
-        return "win" if away_goals >= home_goals else "loss"
-    if market == "draw_no_bet_home":
-        if home_goals == away_goals:
-            return "void"  # stake returned — treat separately if needed
-        return "win" if home_goals > away_goals else "loss"
-    if market == "draw_no_bet_away":
-        if home_goals == away_goals:
-            return "void"
-        return "win" if away_goals > home_goals else "loss"
-    if market == "btts_yes":
-        return "win" if (home_goals > 0 and away_goals > 0) else "loss"
-    if market == "over25":
-        return "win" if total_goals > 2.5 else "loss"
-
-    logger.warning(f"[RESULT_CHECK] Unknown market '{market}' — marking void.")
-    return "void"
+    outcome = grade_market(market, home_goals, away_goals)
+    if market not in {
+        "home_win", "away_win", "draw", "double_chance_home", "double_chance_away",
+        "draw_no_bet_home", "draw_no_bet_away", "btts_yes", "over25",
+    }:
+        logger.warning(f"[RESULT_CHECK] Unknown market '{market}' — marking void.")
+    return outcome
 
 
 def run(today: date | None = None) -> None:
@@ -182,16 +163,21 @@ def run(today: date | None = None) -> None:
     logger.info(f"[RESULT_CHECK] Checking pending tickets before {today}...")
 
     pending_tickets = supabase_client.get_pending_tickets(before_date=today)
-    if not pending_tickets:
-        logger.info("[RESULT_CHECK] No pending tickets to check.")
+    pending_model_logs = supabase_client.get_pending_model_logs(before_date=today)
+    if not pending_tickets and not pending_model_logs:
+        logger.info("[RESULT_CHECK] No pending tickets or model logs to check.")
         return
 
-    logger.info(f"[RESULT_CHECK] Found {len(pending_tickets)} pending ticket(s).")
+    logger.info(
+        f"[RESULT_CHECK] Found {len(pending_tickets)} pending ticket(s) and "
+        f"{len(pending_model_logs)} unsettled model log(s)."
+    )
 
     # Several old selections can reference the same fixture. Fetch each match
     # at most once per run, while still grading every database selection.
     result_cache: dict[int, dict | None] = {}
     updated_selections = 0
+    updated_model_logs = 0
     completed_tickets = 0
 
     for ticket in pending_tickets:
@@ -263,9 +249,32 @@ def run(today: date | None = None) -> None:
             if supabase_client.update_ticket_outcome(ticket_date, ticket_outcome):
                 completed_tickets += 1
 
+    # Settle every logged candidate, not just official selections. This gives
+    # both production and shadow strategies honest later-holdout diagnostics.
+    logs_by_fixture: dict[int, list[dict]] = {}
+    for item in pending_model_logs:
+        if item.get("fixture_id") is not None and item.get("id") is not None:
+            logs_by_fixture.setdefault(int(item["fixture_id"]), []).append(item)
+
+    for fixture_id, logs in logs_by_fixture.items():
+        if fixture_id not in result_cache:
+            result_cache[fixture_id] = fetch_result(fixture_id)
+        result = result_cache[fixture_id]
+        if result is None:
+            continue
+        for item in logs:
+            outcome = grade_selection(
+                item.get("market", ""), result["home_goals"], result["away_goals"]
+            )
+            if supabase_client.update_model_log_outcome(
+                int(item["id"]), outcome, result["home_goals"], result["away_goals"]
+            ):
+                updated_model_logs += 1
+
     logger.info(
-        f"[RESULT_CHECK] Finished: {updated_selections} selection(s) updated, "
-        f"{completed_tickets} ticket(s) completed, {len(result_cache)} unique fixture(s) fetched."
+        f"[RESULT_CHECK] Finished: {updated_selections} selection(s) and "
+        f"{updated_model_logs} model log(s) updated, {completed_tickets} ticket(s) "
+        f"completed, {len(result_cache)} unique fixture(s) fetched."
     )
 
 

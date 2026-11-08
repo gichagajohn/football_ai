@@ -1008,6 +1008,18 @@ def _extract_odds_snapshot(odds_event: dict) -> dict:
                         offer("btts_yes", outcome, book)
                     elif name.lower() == "no":
                         offer("btts_no", outcome, book)
+                elif key == "draw_no_bet":
+                    if name == home_team:
+                        offer("draw_no_bet_home", outcome, book)
+                    elif name == away_team:
+                        offer("draw_no_bet_away", outcome, book)
+                elif key == "double_chance" and "draw" in name.lower():
+                    # Team names are provider-supplied for this event; only a
+                    # direct double-chance offer is accepted, never a 1X2 sum.
+                    if home_team and home_team.lower() in name.lower():
+                        offer("double_chance_home", outcome, book)
+                    elif away_team and away_team.lower() in name.lower():
+                        offer("double_chance_away", outcome, book)
 
     if snapshot:
         updates = [v.get("last_update") for v in price_sources.values() if v.get("last_update")]

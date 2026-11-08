@@ -34,11 +34,13 @@ Direct 1X2 and over-2.5 prices come from The Odds API's featured bulk markets
 market request. BTTS probabilities are still computed by Dixon–Coles, and the
 parser can accept BTTS prices if supplied, but BTTS is not requested by default:
 The Odds API classifies it as an additional market requiring per-event requests.
-Double-chance and draw-no-bet prices are reproducibly derived from quoted 1X2
-prices and are labeled `derived_from_bookmaker_1x2`. Joint probability assumes
-independence between fixtures and is an estimate, not a guarantee. Longer
-tickets normally have much lower joint win probability even when every leg
-passes the EV gate.
+Double-chance and draw-no-bet selections require direct bookmaker quotes; their
+prices are never derived from 1X2. Their probability baselines may still be
+derived for modelling, but a missing executable quote rejects the candidate.
+DNB probabilities are conditional on a non-draw, and a draw settles as a push.
+Joint portfolio confidence assumes independence between fixtures and is an
+estimate, not a guarantee. Longer tickets normally have much lower joint win
+probability even when every leg passes the EV gate.
 
 `FORCE_PUBLISH: "true"` bypasses only Gemini Auditor/Decision warnings. It
 cannot bypass history, model metadata, probability, EV, unique-fixture, finite
@@ -187,23 +189,52 @@ FORCE_PUBLISH=true
 ## Evaluation
 
 Every evaluated candidate can be logged with model/calibration versions, raw
-and calibrated model probabilities, market probabilities, fair odds,
-quoted/derived price, EV, eligibility, rejection reason, selection status, and
-feature snapshots.
+and calibrated model probabilities, market probabilities, fair odds, direct
+quoted price, EV, eligibility, rejection reason, selection status, kickoff, and
+feature snapshots. Apply `20261108_portfolio_shadow.sql` before enabling the
+Stage 2 code. Detailed candidate and shadow logs remain private under RLS.
 
-After selections have settled, generate a calibration report locally with the
-Supabase environment variables set:
+The pre-registered `robust_conservative_v1` strategy is **shadow-only**. It uses
+50% model + 50% no-vig market probability, requires robust probability >=55%
+and robust EV >=3%, uses the production portfolio limits, and is never emailed
+or published. Shadow rows always have `selected=false`, so they cannot enter
+official calibration. Result checking settles production and shadow candidate
+logs independently; DNB draws are stored as `void` pushes.
+
+After selections have settled, generate official calibration plus the private
+production-optimizer/shadow comparison locally with Supabase variables set:
 
 ```bat
 py -m backend.model_report
 ```
 
-It reports Brier score, log loss, hit rate, flat-stake ROI, and probability
-calibration buckets. `backend.models.backtesting.walk_forward_backtest` also
-supports chronological train/test evaluation without fitting on future
-matches. Historical odds are optional for calibration but required for
-backtested EV/ROI. Small samples and a few large winners can dominate ROI;
-none of these statistics guarantees future profit.
+The comparison reports Brier/log loss, flat-stake singles and daily accumulator
+ROI, average odds, hit rate, pushes, break-even win rate, maximum drawdown,
+unique fixtures, market/league/odds bands, and CLV coverage. Production
+optimizer selections are not necessarily official publications because the
+Auditor/Decision can still return `NO BET`.
+
+For a historical exact-analyst/portfolio walk-forward, supply a JSON list (or a
+`matches` object) of football-data.org-style finished matches with
+`odds_snapshot` and optional `closing_odds_snapshot`:
+
+```bat
+py -m backend.models.portfolio_backtesting history.json --initial-train 200 --output report.json
+```
+
+It calls `run_analyst` and `run_portfolio` directly, fits only on matches before
+each UTC test day, recalibrates only on earlier selected production outcomes,
+and compares production, shadow, and no-vig 1X2 bookmaker-favorite baselines.
+Historical LLM risk decisions are not reproducible and are explicitly not
+replayed. `closing_odds_snapshot` is used only after settlement for
+`taken_odds / closing_odds - 1`; missing closing prices produce null CLV and
+zero coverage, never a fake zero CLV. Accumulator DNB pushes reduce the
+winning ticket's effective odds; an all-push ticket returns its stake.
+
+`backend.models.backtesting.walk_forward_backtest` retains the older flat 1X2
+report. Small samples and a few large winners can dominate ROI; no backtest,
+shadow result, or calibration statistic guarantees future profit or activates
+a strategy automatically.
 
 ## Tests
 
@@ -239,7 +270,11 @@ backend/
     markets.py              Margin removal, blending, EV
     poisson_service.py      Multi-season historical acquisition and model fits
     learning.py             Holdout-gated probability self-calibration
-    backtesting.py          Walk-forward evaluation
+    portfolio_optimizer.py  Shared production/backtest/shadow beam optimizer
+    conservative_shadow.py  Pre-registered private robust strategy
+    backtesting.py          Original flat 1X2 walk-forward evaluation
+    portfolio_backtesting.py Exact analyst/portfolio walk-forward + metrics
+    settlement.py           Shared win/loss/DNB-push grading
     evaluation.py           Brier/log-loss/ROI metrics
   db/
     supabase_client.py      Ticket, result, and private model-log storage

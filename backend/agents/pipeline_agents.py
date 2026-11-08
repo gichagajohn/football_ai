@@ -12,6 +12,12 @@ from backend.gemini_client import gemini_chat as _gemini_chat, get_last_finish_r
 from backend.models.dixon_coles import MODEL_VERSION
 from backend.models.markets import blend_probabilities, normalized_implied, value_metrics
 from backend.models.learning import calibrate_probability
+from backend.models.portfolio_optimizer import (
+    PortfolioLimits,
+    optimize_portfolio,
+    portfolio_utility as shared_portfolio_utility,
+)
+from backend.models.conservative_shadow import build_conservative_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -200,60 +206,15 @@ def _extract_json(text: str) -> dict:
 
 
 def _derive_odds(market: str, odds_snapshot: dict) -> float | None:
-    try:
-        home = odds_snapshot.get("home_win")
-        draw = odds_snapshot.get("draw")
-        away = odds_snapshot.get("away_win")
+    """Return only a directly quoted, executable price for a supported market.
 
-        if market == "home_win":
-            return _valid(home)
-
-        if market == "away_win":
-            return _valid(away)
-
-        if market == "draw":
-            return _valid(draw)
-
-        if market == "btts_yes":
-            return _valid(odds_snapshot.get("btts_yes"))
-
-        if market == "over25":
-            return _valid(odds_snapshot.get("over25"))
-
-        if market == "double_chance_home" and home and draw:
-            implied = (1 / home) + (1 / draw)
-            return _valid(round(1 / implied, 3)) if implied > 0 else None
-
-        if market == "double_chance_away" and away and draw:
-            implied = (1 / away) + (1 / draw)
-            return _valid(round(1 / implied, 3)) if implied > 0 else None
-
-        if market == "draw_no_bet_home" and home and draw:
-            p_home = 1 / home
-            p_draw = 1 / draw
-            p_away = 1 / away if away else max(0.01, 1 - p_home - p_draw)
-            adj_p_home = (
-                p_home / (p_home + p_away)
-                if (p_home + p_away) > 0
-                else None
-            )
-            return _valid(round(1 / adj_p_home, 3)) if adj_p_home else None
-
-        if market == "draw_no_bet_away" and away and draw:
-            p_home = 1 / home if home else 0
-            p_draw = 1 / draw
-            p_away = 1 / away
-            adj_p_away = (
-                p_away / (p_home + p_away)
-                if (p_home + p_away) > 0
-                else None
-            )
-            return _valid(round(1 / adj_p_away, 3)) if adj_p_away else None
-
+    The historical helper name is retained for internal compatibility, but no
+    price is derived. In particular, 1X2 quotes cannot prove that a DNB or
+    double-chance ticket was actually available at a calculated price.
+    """
+    if market not in SUPPORTED_MARKETS:
         return None
-
-    except (TypeError, ZeroDivisionError):
-        return None
+    return _valid(odds_snapshot.get(market))
 
 
 def _valid(odds: float | None) -> float | None:
@@ -265,7 +226,7 @@ def _valid(odds: float | None) -> float | None:
     except (TypeError, ValueError):
         return None
 
-    if odds < 1.01:
+    if not math.isfinite(odds) or odds < 1.01:
         return None
 
     return odds
@@ -587,19 +548,20 @@ Return exactly {len(batch)} assessments:
 
 def _portfolio_utility(selections: list[dict]) -> tuple[float, float, float, float]:
     """Expected log growth with a capped Kelly stake for the whole ticket."""
-    combined_odds = math.prod(float(sel["odds"]) for sel in selections)
-    joint_probability = math.prod(float(sel["model_prob"]) for sel in selections)
-    expected_value = joint_probability * combined_odds - 1.0
-    net_odds = combined_odds - 1.0
-    if net_odds <= 0 or expected_value < 0:
-        return -math.inf, combined_odds, joint_probability, expected_value
-    kelly_fraction = max(0.0, expected_value / net_odds)
-    stake = min(PORTFOLIO_MAX_STAKE, kelly_fraction)
-    utility = (
-        joint_probability * math.log1p(stake * net_odds)
-        + (1.0 - joint_probability) * math.log1p(-stake)
+    return shared_portfolio_utility(
+        selections, probability_key="model_prob", max_stake=PORTFOLIO_MAX_STAKE
     )
-    return utility, combined_odds, joint_probability, expected_value
+
+
+def _portfolio_limits() -> PortfolioLimits:
+    return PortfolioLimits(
+        min_selections=MIN_SELECTIONS,
+        max_selections=MAX_SELECTIONS,
+        combined_odds_min=COMBINED_ODDS_MIN,
+        combined_odds_max=COMBINED_ODDS_MAX,
+        beam_width=PORTFOLIO_BEAM_WIDTH,
+        max_stake=PORTFOLIO_MAX_STAKE,
+    )
 
 
 def run_portfolio(safe_matches: list[dict]) -> dict:
@@ -623,6 +585,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 "home_team": match.get("home_team"),
                 "away_team": match.get("away_team"),
                 "league": match.get("league"),
+                "kickoff_utc": match.get("kickoff_utc"),
                 "market": market,
                 "model_version": match.get("model_version", MODEL_VERSION),
                 "calibration_version": calibration.get("version"),
@@ -630,10 +593,7 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 "model_prob": model_prob,
                 "bookmaker_odds": odds,
                 "market_implied_prob": (match.get("market_probabilities") or {}).get(market),
-                "odds_source": (
-                    "bookmaker" if market in ("home_win", "draw", "away_win", "btts_yes", "over25")
-                    else "derived_from_bookmaker_1x2"
-                ),
+                "odds_source": "bookmaker",
                 "feature_snapshot": match.get("feature_snapshot", {}),
                 "eligible": False,
                 "selected": False,
@@ -692,91 +652,24 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 "feature_snapshot": match.get("feature_snapshot", {}),
                 "odds_source": evaluation["odds_source"],
             }
-            utility, *_ = _portfolio_utility([candidate])
-            candidate["_single_utility"] = utility
             candidates.append(candidate)
 
-    # One market per fixture. Beam width bounds memory/CPU only; it does not
-    # bound fixture count, selection count, or combined odds.
-    best_by_fixture = {}
-    for candidate in candidates:
-        current = best_by_fixture.get(candidate["fixture_id"])
-        key = (candidate["_single_utility"], candidate["model_prob"], -candidate["odds"])
-        if current is None or key > current[0]:
-            best_by_fixture[candidate["fixture_id"]] = (key, candidate)
-    candidates = [entry[1] for entry in best_by_fixture.values()]
-    candidates.sort(key=lambda c: c["_single_utility"], reverse=True)
-
-    if not candidates:
-        return {
-            "decision": "NO_BET",
-            "reason": "No selection passed the probability, price and non-negative-EV gates.",
-            "candidate_evaluations": evaluations,
-        }
-
-    def state_key(state):
-        selections, utility, combined, joint_probability, _ = state
-        return utility, joint_probability, -len(selections), -combined
-
-    # State = (selections, utility, combined odds, joint probability, EV).
-    states = [([], 0.0, 1.0, 1.0, 0.0)]
-    best = None
-    for candidate in candidates:
-        additions = []
-        for state in states:
-            selections = state[0] + [candidate]
-            if MAX_SELECTIONS > 0 and len(selections) > MAX_SELECTIONS:
-                continue
-            combined = state[2] * candidate["odds"]
-            joint_probability = state[3] * candidate["model_prob"]
-            if not math.isfinite(combined) or not math.isfinite(joint_probability):
-                continue
-            if combined < COMBINED_ODDS_MIN:
-                continue
-            if COMBINED_ODDS_MAX > 0 and combined > COMBINED_ODDS_MAX + 1e-9:
-                continue
-            net_odds = combined - 1.0
-            portfolio_ev = joint_probability * combined - 1.0
-            if net_odds <= 0 or portfolio_ev < 0:
-                continue
-            stake = min(PORTFOLIO_MAX_STAKE, max(0.0, portfolio_ev / net_odds))
-            utility = (
-                joint_probability * math.log1p(stake * net_odds)
-                + (1.0 - joint_probability) * math.log1p(-stake)
-            )
-            if not math.isfinite(utility):
-                continue
-            new_state = (selections, utility, combined, joint_probability, portfolio_ev)
-            additions.append(new_state)
-            if len(selections) >= MIN_SELECTIONS:
-                key = state_key(new_state)
-                if best is None or key > best[0]:
-                    best = (key, new_state)
-
-        states.extend(additions)
-        states.sort(key=state_key, reverse=True)
-        # Keep strong states plus representatives of other leg counts so both
-        # shorter and longer portfolios survive for the next iteration.
-        kept = states[:PORTFOLIO_BEAM_WIDTH]
-        covered_lengths = {len(state[0]) for state in kept}
-        for state in states[PORTFOLIO_BEAM_WIDTH:]:
-            length = len(state[0])
-            if length not in covered_lengths:
-                kept.append(state)
-                covered_lengths.add(length)
-            if len(kept) >= PORTFOLIO_BEAM_WIDTH * 2:
-                break
-        states = kept
-
-    if best is None:
+    optimised = optimize_portfolio(
+        candidates,
+        _portfolio_limits(),
+        probability_key="model_prob",
+    )
+    if optimised is None:
         return {
             "decision": "NO_BET",
             "reason": f"No positive-EV combination satisfies {SELECTION_LIMIT_TEXT} and {ODDS_LIMIT_TEXT}.",
             "candidate_evaluations": evaluations,
         }
 
-    _, best_state = best
-    selections, _, combined_odds, joint_probability, portfolio_ev = best_state
+    selections = optimised["selections"]
+    combined_odds = optimised["combined_odds"]
+    joint_probability = optimised["portfolio_confidence"]
+    portfolio_ev = optimised["portfolio_expected_value"]
     selected_keys = {(s["fixture_id"], s["market"]) for s in selections}
     for evaluation in evaluations:
         evaluation["selected"] = (evaluation["fixture_id"], evaluation["market"]) in selected_keys
@@ -811,6 +704,12 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
         "risk_level": risk_level,
         "candidate_evaluations": evaluations,
     }
+
+
+def run_conservative_shadow(candidate_evaluations: list[dict]) -> dict:
+    """Evaluate the pre-registered alternative without publishing it."""
+    return build_conservative_shadow(candidate_evaluations, _portfolio_limits())
+
 
 def _portfolio_for_llm(portfolio: dict) -> dict:
     """Keep rejected-candidate diagnostics and feature blobs out of LLM prompts."""

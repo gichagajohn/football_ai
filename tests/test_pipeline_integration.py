@@ -67,6 +67,36 @@ def test_full_pipeline_can_store_a_valid_single(monkeypatch):
     assert len(portfolio["selections"]) == 1
     assert decision["decision"] == "PUBLISH"
     assert portfolio["selections"][0]["model_version"] == "dixon_coles_v1"
+    assert store.call_args.kwargs["shadow_portfolio"]["is_shadow"] is True
+
+
+def test_shadow_failure_does_not_block_official_pipeline(monkeypatch):
+    match = {
+        "fixture_id": 999, "home_team": "Home", "away_team": "Away",
+        "home_team_id": 10, "away_team_id": 20, "competition_code": "PL",
+        "league": "Premier League", "kickoff_utc": "2026-11-05T15:00:00Z",
+        "data_completeness": 1.0,
+        "odds_snapshot": {"home_win": 2.0, "draw": 4.0, "away_win": 5.0},
+        "recent_form": {"home": {}, "away": {}},
+        "standings": {"home": {}, "away": {}}, "injuries": {"home": [], "away": []},
+    }
+    context = {"models": {"PL": PipelineModel()}}
+    monkeypatch.setattr(agents, "FORCE_PUBLISH", True)
+    with (
+        patch.object(pipeline, "run_scout", new=AsyncMock(return_value=[match])),
+        patch.object(pipeline, "build_poisson_context", new=AsyncMock(return_value=context)),
+        patch.object(pipeline, "load_probability_calibrator", return_value={"active": False}),
+        patch.object(pipeline, "run_risk_filter", side_effect=lambda probabilities, intelligence: probabilities),
+        patch.object(pipeline, "run_conservative_shadow", side_effect=RuntimeError("shadow failed")),
+        patch.object(pipeline, "run_auditor", return_value={"auditor_verdict": "APPROVE", "critical_flags": []}),
+        patch.object(pipeline, "run_publisher", return_value="Official ticket"),
+        patch.object(pipeline.supabase_client, "store_ticket") as store,
+    ):
+        ticket = asyncio.run(pipeline.run_pipeline(date(2026, 11, 5)))
+    assert ticket == "Official ticket"
+    store.assert_called_once()
+    assert store.call_args.kwargs["shadow_portfolio"] is None
+    assert store.call_args.args[2]["selections"]
 
 
 def test_llm_portfolio_excludes_private_candidate_evaluations():

@@ -80,6 +80,7 @@ def store_ticket(
     ticket_text: str,
     portfolio: dict,
     decision: dict,
+    shadow_portfolio: dict | None = None,
 ) -> bool:
     """Atomically store one complete ticket snapshot in Supabase.
 
@@ -147,6 +148,8 @@ def store_ticket(
     # A missing optional logging table must never prevent ticket settlement or
     # suppress an otherwise safely stored ticket email.
     _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [])
+    if shadow_portfolio:
+        _store_shadow_prediction_logs(target_date, shadow_portfolio)
     return True
 
 
@@ -162,7 +165,10 @@ def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
             "home_team": item.get("home_team"),
             "away_team": item.get("away_team"),
             "league": item.get("league"),
+            "kickoff_utc": item.get("kickoff_utc"),
             "market": item.get("market"),
+            "strategy": "production",
+            "shadow_selected": False,
             "model_version": item.get("model_version") or "unknown",
             "calibration_version": item.get("calibration_version"),
             "raw_model_prob": item.get("raw_model_prob"),
@@ -171,6 +177,7 @@ def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
             "bookmaker_implied_prob": item.get("bookmaker_implied_prob"),
             "fair_odds": item.get("fair_odds"),
             "bookmaker_odds": item.get("bookmaker_odds"),
+            "closing_bookmaker_odds": item.get("closing_bookmaker_odds"),
             "odds_source": item.get("odds_source"),
             "expected_value": item.get("expected_value"),
             "eligible": bool(item.get("eligible")),
@@ -195,6 +202,123 @@ def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
             f"[SUPABASE] Model logging failed (ticket storage continues): {e}. "
             "Apply backend/db/migrations/20261104_poisson_prediction_logs.sql."
         )
+
+
+def _store_shadow_prediction_logs(target_date: date, shadow: dict) -> None:
+    """Persist shadow candidates privately without affecting official storage."""
+    strategy = shadow.get("strategy") or "unknown_shadow"
+    rows = []
+    for item in shadow.get("candidate_evaluations") or []:
+        if item.get("fixture_id") is None or not item.get("market"):
+            continue
+        features = dict(item.get("feature_snapshot") or {})
+        features["shadow_evaluation"] = {
+            "config": shadow.get("config") or {},
+            "combined_odds": shadow.get("combined_odds"),
+            "portfolio_confidence": shadow.get("portfolio_confidence"),
+            "portfolio_expected_value": shadow.get("portfolio_expected_value"),
+        }
+        robust_probability = item.get("robust_model_prob")
+        rows.append({
+            "ticket_date": target_date.isoformat(),
+            "fixture_id": item.get("fixture_id"),
+            "home_team": item.get("home_team"),
+            "away_team": item.get("away_team"),
+            "league": item.get("league"),
+            "kickoff_utc": item.get("kickoff_utc"),
+            "market": item.get("market"),
+            "strategy": strategy,
+            "shadow_selected": bool(item.get("shadow_selected")),
+            "model_version": f"{item.get('model_version') or 'unknown'}__shadow_{strategy}",
+            "calibration_version": item.get("calibration_version"),
+            "raw_model_prob": item.get("raw_model_prob"),
+            "model_prob": item.get("model_prob"),
+            "robust_model_prob": robust_probability,
+            "market_implied_prob": item.get("market_implied_prob"),
+            "bookmaker_implied_prob": item.get("bookmaker_implied_prob"),
+            "fair_odds": (1.0 / float(robust_probability)) if robust_probability else None,
+            "bookmaker_odds": item.get("bookmaker_odds"),
+            "closing_bookmaker_odds": item.get("closing_bookmaker_odds"),
+            "odds_source": item.get("odds_source"),
+            "expected_value": item.get("expected_value"),
+            "robust_expected_value": item.get("robust_expected_value"),
+            "eligible": bool(item.get("eligible")),
+            # Never train official calibration on an experimental shadow pick.
+            "selected": False,
+            "rejection_reason": item.get("rejection_reason"),
+            "feature_snapshot": features,
+        })
+    if not rows:
+        return
+    try:
+        resp = httpx.post(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates, return=minimal"},
+            params={"on_conflict": "ticket_date,fixture_id,market,model_version"},
+            json=rows,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        logger.info(
+            f"[SUPABASE] Stored {len(rows)} private shadow evaluation(s) for {strategy}."
+        )
+    except Exception as e:
+        logger.error(
+            f"[SUPABASE] Shadow logging failed (official ticket continues): {e}. "
+            "Apply backend/db/migrations/20261108_portfolio_shadow.sql."
+        )
+
+
+def get_pending_model_logs(before_date: date, limit: int = 5000) -> list[dict]:
+    """Return unsettled private diagnostics for finished-result processing."""
+    if not _enabled():
+        return []
+    try:
+        resp = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers=HEADERS,
+            params={
+                "ticket_date": f"lt.{before_date.isoformat()}",
+                "outcome": "eq.pending",
+                "select": "id,fixture_id,market,kickoff_utc,ticket_date,strategy",
+                "order": "ticket_date.asc,fixture_id.asc",
+                "limit": str(limit),
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SUPABASE] Failed to fetch pending model logs: {e}")
+        return []
+
+
+def update_model_log_outcome(
+    log_id: int,
+    outcome: str,
+    home_score: int,
+    away_score: int,
+) -> bool:
+    """Settle one diagnostic row once; a pending guard makes retries safe."""
+    if not _enabled():
+        return False
+    try:
+        resp = httpx.patch(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers={**HEADERS, "Prefer": "return=representation"},
+            params={"id": f"eq.{log_id}", "outcome": "eq.pending"},
+            json={
+                "outcome": outcome,
+                "home_score": home_score,
+                "away_score": away_score,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return bool(resp.json())
+    except Exception as e:
+        logger.error(f"[SUPABASE] Failed to settle model log {log_id}: {e}")
+        return False
 
 
 def get_pending_tickets(before_date: date) -> list[dict]:
@@ -301,6 +425,33 @@ def update_ticket_outcome(ticket_date: date, outcome: str) -> bool:
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to update ticket outcome: {e}")
     return False
+
+
+def get_strategy_prediction_logs(limit: int = 50000) -> list[dict]:
+    """Fetch private production/shadow logs for the post-settlement report."""
+    if not _enabled():
+        return []
+    try:
+        resp = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers=HEADERS,
+            params={
+                "select": (
+                    "ticket_date,created_at,fixture_id,home_team,away_team,league,market,"
+                    "strategy,model_version,selected,shadow_selected,raw_model_prob,model_prob,"
+                    "robust_model_prob,market_implied_prob,bookmaker_odds,closing_bookmaker_odds,"
+                    "outcome,home_score,away_score,kickoff_utc"
+                ),
+                "order": "ticket_date.asc,created_at.asc",
+                "limit": str(limit),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[SUPABASE] Failed to fetch strategy prediction logs: {e}")
+        return []
 
 
 def get_prediction_logs(limit: int = 10000) -> list[dict]:

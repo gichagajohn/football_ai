@@ -13,6 +13,7 @@ from backend.agents.pipeline_agents import (
     run_analyst,
     run_risk_filter,
     run_portfolio,
+    run_conservative_shadow,
     run_auditor,
     run_decision,
     run_publisher,
@@ -131,6 +132,19 @@ async def run_pipeline(target_date: date | None = None) -> str:
     portfolio = run_portfolio(safe_matches)
     logger.info(f"[6/9] Portfolio: {portfolio.get('combined_odds', 'N/A')} combined odds.")
 
+    # Experimental alternative is logged privately only. It never reaches the
+    # Auditor, Decision, Publisher, website, or official ticket email.
+    try:
+        shadow_portfolio = run_conservative_shadow(portfolio.get("candidate_evaluations", []))
+        logger.info(
+            f"[6/9] Shadow {shadow_portfolio.get('strategy')}: "
+            f"{len(shadow_portfolio.get('selections', []))} selection(s), "
+            f"{shadow_portfolio.get('combined_odds', 'N/A')} combined odds (private evaluation only)."
+        )
+    except Exception as exc:
+        logger.error(f"[6/9] Conservative shadow evaluation failed safely: {exc}")
+        shadow_portfolio = None
+
     # ── AGENT 7: AUDITOR ─────────────────────────────────────────
     logger.info("[7/9] AUDITOR AGENT running...")
     audited = run_auditor(portfolio)
@@ -149,7 +163,9 @@ async def run_pipeline(target_date: date | None = None) -> str:
     logger.info("=" * 60)
     logger.info(f"\n{ticket}")
 
-    supabase_client.store_ticket(target_date, ticket, portfolio, decision)
+    supabase_client.store_ticket(
+        target_date, ticket, portfolio, decision, shadow_portfolio=shadow_portfolio
+    )
 
     return ticket
 
