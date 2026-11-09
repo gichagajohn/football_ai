@@ -34,8 +34,17 @@ def training_examples_from_rows(logs: list[dict], selections: list[dict]) -> lis
         (str(row.get("ticket_date")), str(row.get("fixture_id")), row.get("market")): row.get("outcome")
         for row in selections
     }
-    examples = []
+    # Logs are append-only: a rerun inserts fresh rows rather than overwriting.
+    # Keep one row per (ticket_date, fixture_id, market) — the most recently
+    # written one — so calibration never double-counts the same prediction.
+    latest_by_key: dict[tuple[str, str, str], dict] = {}
     for row in logs:
+        key = (str(row.get("ticket_date")), str(row.get("fixture_id")), row.get("market"))
+        current = latest_by_key.get(key)
+        if current is None or str(row.get("created_at") or "") >= str(current.get("created_at") or ""):
+            latest_by_key[key] = row
+    examples = []
+    for row in latest_by_key.values():
         if not row.get("selected"):
             continue
         key = (str(row.get("ticket_date")), str(row.get("fixture_id")), row.get("market"))

@@ -6,6 +6,7 @@ final published ticket as a string (for emailing).
 
 import logging
 import os
+import uuid
 from datetime import date
 
 from backend.agents.scout_agent import run as run_scout
@@ -61,6 +62,10 @@ async def run_pipeline(target_date: date | None = None) -> str:
     """Full pipeline run. Returns the final published ticket as a string."""
     target_date = target_date or date.today()
     date_str = target_date.strftime("%A, %d %B %Y")
+    # One opaque id per run, stamped on the ticket and every prediction log
+    # row so diagnostics, settlement and audits can be joined deterministically.
+    run_id = str(uuid.uuid4())
+    logger.info(f"  Run ID: {run_id}")
     logger.info("=" * 60)
     logger.info("  FOOTBALL PULSE AI — Pipeline Start")
     logger.info(f"  Target Date: {date_str}")
@@ -83,7 +88,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         logger.warning(f"NO BET TODAY — Scout found no priceable fixtures for {date_str}.")
-        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "No priceable fixtures found."})
+        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "No priceable fixtures found."}, run_id=run_id)
         return ticket
 
     # ── AGENT 2: CLEANER ─────────────────────────────────────────
@@ -109,7 +114,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         logger.warning("No matches passed cleaning threshold.")
-        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "All matches failed cleaning threshold."})
+        supabase_client.store_ticket(target_date, ticket, {}, {"decision": "NO_BET", "reason": "All matches failed cleaning threshold."}, run_id=run_id)
         return ticket
 
     # ── AGENT 3: ANALYST ────────────────────────────────────────
@@ -164,7 +169,7 @@ async def run_pipeline(target_date: date | None = None) -> str:
     logger.info(f"\n{ticket}")
 
     supabase_client.store_ticket(
-        target_date, ticket, portfolio, decision, shadow_portfolio=shadow_portfolio
+        target_date, ticket, portfolio, decision, shadow_portfolio=shadow_portfolio, run_id=run_id
     )
 
     return ticket

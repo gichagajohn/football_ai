@@ -1,0 +1,56 @@
+name: Football Pulse AI — Closing Prices
+
+on:
+  schedule:
+    # 07:00, 13:00, 19:00 EAT (= 04:00, 10:00, 16:00 UTC).
+    # Captured shortly before most weekend/evening kickoffs; only fixtures
+    # that have not started yet are captured (never in-play).
+    - cron: "0 4,10,16 * * *"
+
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "ISO date to capture for (default: today, UTC)"
+        required: false
+        default: ""
+
+# Serialize with itself; never cancel. Independent of the daily production run.
+concurrency:
+  group: football-pulse-closing-prices
+  cancel-in-progress: false
+
+# The Odds API free tier allows 500 requests per month. This job only queries
+# competitions that hold a pending published leg for the target date, at the
+# most about once per competition per run (featured h2h,totals markets). That
+# is typically 1–4 calls per run, i.e. ~3–12 calls per day worst case.
+# Running this three times a day leaves comfortable headroom alongside the
+# daily pipeline. Quota exhaustion degrades to "closing prices stay NULL",
+# never to fabricated prices.
+
+jobs:
+  capture-closing-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Capture closing prices
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+        run: python -m backend.capture_closing

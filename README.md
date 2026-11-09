@@ -44,7 +44,20 @@ probability even when every leg passes the EV gate.
 
 `FORCE_PUBLISH: "true"` bypasses only Gemini Auditor/Decision warnings. It
 cannot bypass history, model metadata, probability, EV, unique-fixture, finite
-odds, or configured-limit validation.
+odds, configured-limit validation, or the hard provenance gate (below).
+
+**Provenance gate (Stage A).** Before any candidate reaches the portfolio
+optimiser it must prove: the prediction is produced before kickoff; the price
+it would be published at is a directly quoted bookmaker price whose
+`last_update` is at-or-before kickoff and within `PROVENANCE_MAX_FUTURE_PRICE_SKEW_SECONDS`
+(default 120, per the Stage A contract in `MODEL_INTELLIGENCE.md` in the Pulse repository) of the prediction moment;
+decimal odds > 1; and both probabilities in (0, 1). Failures are rejected with
+`rejection_reason = "Provenance: ..."`, are never optimiser inputs, and no
+portfolio built without them can be published — a clean NO BET is the correct
+outcome. `FORCE_PUBLISH` cannot rescue an unprovenanced candidate.
+`PROVENANCE_REQUIRE_PRICE_TIMESTAMP=true` (the daily workflow) additionally
+rejects candidates whose price carries no timestamp at all — an unverifiable
+price is not an executable price.
 
 Gemini is used for injury/weather context, risk review, auditing, and ticket
 wording. Provider fixture IDs, names, team IDs, kickoff times, and odds always
@@ -131,6 +144,8 @@ existing installation, preserve the earlier result repair and then apply:
 backend/db/migrations/20261104_poisson_prediction_logs.sql
 backend/db/migrations/20261107_atomic_ticket_storage.sql
 backend/db/migrations/20261108_prediction_integrity.sql
+backend/db/migrations/20261108_portfolio_shadow.sql
+backend/db/migrations/20261110_run_linkage.sql
 ```
 
 The first adds/upgrades private model diagnostics without changing existing
@@ -139,6 +154,10 @@ RPC that stores each summary and its complete selection snapshot atomically,
 removes stale rerun legs, refreshes retained odds, and rejects settled-ticket
 rewrites. The 20261108 migration archives current legacy predictions, adds
 private immutable ticket versions, and rejects publication at/after kickoff.
+`20261110_run_linkage.sql` adds `run_id` to the private diagnostics and ticket
+tables (indexed, nullable) and drops the legacy unique constraint that existed
+only for diagnostic upserts — prediction logs are append-only now, and a rerun
+always preserves the failed run's rows instead of silently overwriting them.
 Apply each migration before deploying backend code that depends on it. Optional
 rollback-only verification is in `backend/db/smoke_tests/`. Keep service-role
 keys secret.
@@ -193,6 +212,25 @@ and calibrated model probabilities, market probabilities, fair odds, direct
 quoted price, EV, eligibility, rejection reason, selection status, kickoff, and
 feature snapshots. Apply `20261108_portfolio_shadow.sql` before enabling the
 Stage 2 code. Detailed candidate and shadow logs remain private under RLS.
+
+Every pipeline invocation generates one opaque `run_id`, stamped on the stored
+ticket and on all prediction-log rows it writes, so diagnostics join
+deterministically to the publication they informed. Prediction logs are
+**append-only**; calibration training deduplicates by
+`(ticket_date, fixture_id, market)` keeping the latest row, so reruns never
+double-count samples.
+
+A separate workflow, `.github/workflows/closing_prices.yml` (07:00, 13:00 and
+19:00 EAT), captures the genuine closing quote for today's pending published
+legs shortly before kickoff and only while one does not already exist
+(`closing_bookmaker_odds`). It queries The Odds API solely for competitions
+holding a pending published leg (a handful of requests per run), never captures
+in-play prices, and leaves NULL where no direct quote was available — missing
+closing coverage is explicit, never fabricated. The free The Odds API tier
+allows 500 requests per month; quota exhaustion degrades to "closing prices
+stay NULL", never to made-up values. Closing coverage is a metric to collect,
+not a gate: today's historical rows have no closing prices and nothing
+backfills them.
 
 The pre-registered `robust_conservative_v1` strategy is **shadow-only**. It uses
 50% model + 50% no-vig market probability, requires robust probability >=55%
@@ -250,18 +288,24 @@ Tests cover the Dixon–Coles fit/matrix, margin removal, analyst integration,
 singles and portfolios above six legs/20 odds, negative-EV rejection,
 forced-publish hard gates, 16-competition defaults, cup history, guarded
 learning, raw/calibrated logging, Scout odds extraction, walk-forward
-evaluation, calibration, and existing result-storage/deduplication behavior.
+evaluation, calibration, and existing result-storage/deduplication behavior, plus
+the provenance gate (kickoff/price ordering, skew tolerance, FORCE_PUBLISH
+semantics), rerun deduplication for calibration samples, and closing-price
+extraction. Backtests evaluate history against the same gate using each day's
+as-of time, so causality is preserved offline as well.
 
 ## Main files
 
 ```text
 .github/workflows/
   daily.yml                 Daily model/ticket workflow
+  closing_prices.yml        Best-effort closing-price capture (07:00/13:00/19:00 EAT)
   weekly.yml                Result settlement and weekly performance report
   result_backfill.yml       Result-only historical repair
   tests.yml                 Regression tests
 
 backend/
+  capture_closing.py        Prospective closing-price capture for published legs
   agents/
     scout_agent.py          Multi-competition fixtures, prices, form, weather
     pipeline_agents.py      Deterministic analyst/portfolio + LLM risk/publishing
@@ -269,7 +313,8 @@ backend/
     dixon_coles.py          Time-weighted Dixon–Coles fit and score matrix
     markets.py              Margin removal, blending, EV
     poisson_service.py      Multi-season historical acquisition and model fits
-    learning.py             Holdout-gated probability self-calibration
+    learning.py             Holdout-gated probability self-calibration (rerun-deduped)
+    provenance.py           Hard pre-publication provenance gate
     portfolio_optimizer.py  Shared production/backtest/shadow beam optimizer
     conservative_shadow.py  Pre-registered private robust strategy
     backtesting.py          Original flat 1X2 walk-forward evaluation

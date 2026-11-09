@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 from backend.models.portfolio_optimizer import PortfolioLimits, optimize_portfolio
+from backend.models.provenance import validate_candidate
 
 SHADOW_STRATEGY = "robust_conservative_v1"
 SHADOW_CONFIG = {
@@ -17,7 +19,10 @@ SHADOW_CONFIG = {
 
 
 def build_conservative_shadow(
-    evaluations: list[dict], limits: PortfolioLimits
+    evaluations: list[dict],
+    limits: PortfolioLimits,
+    *,
+    reference_time: datetime | None = None,
 ) -> dict:
     """Build a private alternative without changing the production portfolio.
 
@@ -53,6 +58,18 @@ def build_conservative_shadow(
             reasons.append("Shadow strategy requires a genuine bookmaker price, not a derived one.")
         if not item.get("kickoff_utc"):
             reasons.append("Shadow strategy requires kickoff_utc.")
+        snapshot = item.get("feature_snapshot") or {}
+        price_source = (snapshot.get("price_sources") or {}).get(item.get("market")) or {}
+        provenance = validate_candidate(
+            created_at=reference_time or datetime.now(timezone.utc),
+            kickoff_utc=item.get("kickoff_utc"),
+            price_updated_at=price_source.get("last_update") if isinstance(price_source, dict) else None,
+            bookmaker_odds=item.get("bookmaker_odds"),
+            model_prob=item.get("model_prob"),
+            market_implied_prob=item.get("market_implied_prob"),
+        )
+        if not provenance["ok"]:
+            reasons.append("Provenance: " + ", ".join(provenance["issues"]))
 
         robust_probability = None
         robust_ev = None

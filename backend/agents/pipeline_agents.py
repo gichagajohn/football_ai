@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+from datetime import datetime, timezone
 
 from backend.gemini_client import gemini_chat as _gemini_chat, get_last_finish_reason
 from backend.models.dixon_coles import MODEL_VERSION
@@ -18,6 +19,7 @@ from backend.models.portfolio_optimizer import (
     portfolio_utility as shared_portfolio_utility,
 )
 from backend.models.conservative_shadow import build_conservative_shadow
+from backend.models.provenance import validate_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -564,7 +566,14 @@ def _portfolio_limits() -> PortfolioLimits:
     )
 
 
-def run_portfolio(safe_matches: list[dict]) -> dict:
+def run_portfolio(safe_matches: list[dict], *, reference_time: datetime | None = None) -> dict:
+    """Evaluate candidates and optimise a portfolio.
+
+    ``reference_time`` is the prediction moment used by the provenance gate
+    (defaults to now). Backtests pass the backtest as-of timestamp so the
+    gate stays causally honest for historical fixtures.
+    """
+    evaluation_time = reference_time or datetime.now(timezone.utc)
     """Build a risk-adjusted portfolio with no mandatory leg/odds ceiling."""
     candidates = []
     evaluations = []
@@ -616,6 +625,23 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
                 "expected_value": metrics["expected_value"],
             })
             reasons = []
+            # Hard provenance gate: a candidate whose inputs cannot be verified
+            # as pre-match and bookmaker-real is never publishable. FORCE_PUBLISH
+            # does not override this.
+            price_sources = odds_snapshot.get("_price_sources") or {}
+            price_source = price_sources.get(market) if isinstance(price_sources, dict) else None
+            provenance = validate_candidate(
+                created_at=evaluation_time,
+                kickoff_utc=match.get("kickoff_utc"),
+                price_updated_at=(price_source or {}).get("last_update") if isinstance(price_source, dict) else None,
+                bookmaker_odds=odds,
+                model_prob=model_prob,
+                market_implied_prob=evaluation.get("market_implied_prob"),
+            )
+            if not provenance["ok"]:
+                reasons.append("Provenance: " + ", ".join(provenance["issues"]))
+            evaluation["provenance_ok"] = provenance["ok"]
+            evaluation["provenance_issues"] = provenance["issues"]
             if float(model_prob) < MIN_SELECTION_PROBABILITY:
                 reasons.append(
                     f"Probability {model_prob:.3f} below {MIN_SELECTION_PROBABILITY:.3f}."
@@ -706,9 +732,9 @@ def run_portfolio(safe_matches: list[dict]) -> dict:
     }
 
 
-def run_conservative_shadow(candidate_evaluations: list[dict]) -> dict:
+def run_conservative_shadow(candidate_evaluations: list[dict], *, reference_time: datetime | None = None) -> dict:
     """Evaluate the pre-registered alternative without publishing it."""
-    return build_conservative_shadow(candidate_evaluations, _portfolio_limits())
+    return build_conservative_shadow(candidate_evaluations, _portfolio_limits(), reference_time=reference_time)
 
 
 def _portfolio_for_llm(portfolio: dict) -> dict:

@@ -60,7 +60,7 @@ def test_provider_parser_retains_only_direct_additional_market_quotes():
 def test_shadow_requires_genuine_prices_and_uses_fifty_fifty_anchor():
     evaluations = [{
         "fixture_id": 1, "home_team": "H", "away_team": "A", "league": "L",
-        "kickoff_utc": "2026-11-09T12:00:00+00:00", "market": "home_win",
+        "kickoff_utc": "2099-11-09T12:00:00+00:00", "market": "home_win",
         "model_version": "test", "raw_model_prob": 0.70, "model_prob": 0.70,
         "bookmaker_odds": 2.0, "market_implied_prob": 0.50,
         "expected_value": 0.40, "odds_source": "bookmaker",
@@ -219,7 +219,7 @@ def test_shadow_storage_marks_private_selection_without_official_selected_flag()
         "config": {"model_weight": 0.5, "market_weight": 0.5},
         "candidate_evaluations": [{
             "fixture_id": 1, "home_team": "H", "away_team": "A", "league": "L",
-            "kickoff_utc": "2026-11-09T12:00:00+00:00", "market": "home_win",
+            "kickoff_utc": "2099-11-09T12:00:00+00:00", "market": "home_win",
             "model_version": "test", "raw_model_prob": 0.7, "model_prob": 0.7,
             "robust_model_prob": 0.6, "robust_expected_value": 0.2,
             "bookmaker_odds": 2.0, "odds_source": "bookmaker",

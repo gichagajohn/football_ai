@@ -84,6 +84,15 @@ jobs:
           CALIBRATION_MIN_SAMPLES: "200"
           CALIBRATION_HALF_LIFE_DAYS: "240"
 
+          # Hard pre-publication provenance gate. A candidate whose inputs
+          # cannot be verified as pre-match and directly bookmaker-priced is
+          # rejected before the portfolio optimiser; if no candidate
+          # survives, the run is NO BET. FORCE_PUBLISH never overrides this.
+          # The 120-second skew is the MODEL_INTELLIGENCE.md contract default;
+          # do not raise it without evidence the provider clock is at fault.
+          PROVENANCE_MAX_FUTURE_PRICE_SKEW_SECONDS: "120"
+          PROVENANCE_REQUIRE_PRICE_TIMESTAMP: "true"
+
           # Bypasses only Auditor/Decision warnings. Hard data, probability,
           # EV, unique-fixture, leg-count and combined-odds gates still apply.
           FORCE_PUBLISH: "true"

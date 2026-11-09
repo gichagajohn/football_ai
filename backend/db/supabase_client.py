@@ -81,6 +81,7 @@ def store_ticket(
     portfolio: dict,
     decision: dict,
     shadow_portfolio: dict | None = None,
+    run_id: str | None = None,
 ) -> bool:
     """Atomically store one complete ticket snapshot in Supabase.
 
@@ -143,22 +144,51 @@ def store_ticket(
         f"[SUPABASE] Stored ticket for {target_date} atomically "
         f"(status={status}, selections={len(selection_rows)})."
     )
+    if run_id:
+        _set_ticket_run_id(target_date, run_id)
 
     # Keep model diagnostics separate from the public ticket/selection tables.
     # A missing optional logging table must never prevent ticket settlement or
     # suppress an otherwise safely stored ticket email.
-    _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [])
+    _store_prediction_logs(target_date, portfolio.get("candidate_evaluations") or [], run_id=run_id)
     if shadow_portfolio:
-        _store_shadow_prediction_logs(target_date, shadow_portfolio)
+        _store_shadow_prediction_logs(target_date, shadow_portfolio, run_id=run_id)
     return True
 
 
-def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
-    """Persist private model diagnostics without affecting ticket storage."""
+def _set_ticket_run_id(target_date: date, run_id: str) -> bool:
+    """Best-effort linkage of this publish run to the stored ticket row."""
+    try:
+        resp = httpx.patch(
+            f"{SUPABASE_URL}/rest/v1/prediction_tickets",
+            headers={**HEADERS, "Prefer": "return=minimal"},
+            params={"ticket_date": f"eq.{target_date.isoformat()}"},
+            json={"run_id": run_id},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"[SUPABASE] Could not stamp run_id on ticket {target_date}: {e}")
+        return False
+
+
+def _store_prediction_logs(target_date: date, evaluations: list[dict], run_id: str | None = None) -> None:
+    """Persist private model diagnostics.
+
+    Rows are inserted, never upserted, so a rerun's candidates coexist with
+    earlier runs instead of silently overwriting them. Deterministic linkage
+    is via ``run_id`` on both ``model_prediction_logs`` and
+    ``prediction_tickets``. Readers that aggregate must deduplicate by
+    (ticket_date, fixture_id, market) keeping the latest created_at.
+    """
     rows = []
     for item in evaluations:
         if item.get("fixture_id") is None or not item.get("market"):
             continue
+        features = dict(item.get("feature_snapshot") or {})
+        if item.get("provenance_issues"):
+            features["provenance"] = {"ok": False, "issues": item["provenance_issues"]}
         rows.append({
             "ticket_date": target_date.isoformat(),
             "fixture_id": item.get("fixture_id"),
@@ -183,15 +213,15 @@ def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
             "eligible": bool(item.get("eligible")),
             "selected": bool(item.get("selected")),
             "rejection_reason": item.get("rejection_reason"),
-            "feature_snapshot": item.get("feature_snapshot") or {},
+            "feature_snapshot": features,
+            "run_id": run_id,
         })
     if not rows:
         return
     try:
         resp = httpx.post(
             f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
-            headers={**HEADERS, "Prefer": "resolution=merge-duplicates, return=minimal"},
-            params={"on_conflict": "ticket_date,fixture_id,market,model_version"},
+            headers={**HEADERS, "Prefer": "return=minimal"},
             json=rows,
             timeout=20,
         )
@@ -200,11 +230,11 @@ def _store_prediction_logs(target_date: date, evaluations: list[dict]) -> None:
     except Exception as e:
         logger.error(
             f"[SUPABASE] Model logging failed (ticket storage continues): {e}. "
-            "Apply backend/db/migrations/20261104_poisson_prediction_logs.sql."
+            "Apply backend/db/migrations/20261110_run_linkage.sql."
         )
 
 
-def _store_shadow_prediction_logs(target_date: date, shadow: dict) -> None:
+def _store_shadow_prediction_logs(target_date: date, shadow: dict, run_id: str | None = None) -> None:
     """Persist shadow candidates privately without affecting official storage."""
     strategy = shadow.get("strategy") or "unknown_shadow"
     rows = []
@@ -247,14 +277,14 @@ def _store_shadow_prediction_logs(target_date: date, shadow: dict) -> None:
             "selected": False,
             "rejection_reason": item.get("rejection_reason"),
             "feature_snapshot": features,
+            "run_id": run_id,
         })
     if not rows:
         return
     try:
         resp = httpx.post(
             f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
-            headers={**HEADERS, "Prefer": "resolution=merge-duplicates, return=minimal"},
-            params={"on_conflict": "ticket_date,fixture_id,market,model_version"},
+            headers={**HEADERS, "Prefer": "return=minimal"},
             json=rows,
             timeout=20,
         )
@@ -463,7 +493,7 @@ def get_prediction_logs(limit: int = 10000) -> list[dict]:
             f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
             headers=HEADERS,
             params={
-                "select": "ticket_date,fixture_id,market,raw_model_prob,model_prob,bookmaker_odds,selected",
+                "select": "ticket_date,fixture_id,market,raw_model_prob,model_prob,bookmaker_odds,selected,created_at",
                 "selected": "eq.true",
                 "order": "ticket_date.desc",
                 "limit": str(limit),
@@ -520,3 +550,41 @@ def get_recent_tickets(limit: int = 30) -> list[dict]:
     except Exception as e:
         logger.error(f"[SUPABASE] Failed to fetch recent tickets: {e}")
         return []
+
+
+def update_closing_price(
+    ticket_date: date,
+    fixture_id: int,
+    market: str,
+    closing_odds: float,
+) -> int:
+    """Stamp the closing price on today's unsettled diagnostic rows.
+
+    Only rows whose closing price is still NULL are updated, so the first
+    captured snapshot wins and reruns of the capture job are no-ops.
+    Returns the number of rows updated (0 when already captured or storage
+    is not configured).
+    """
+    if not _enabled():
+        return 0
+    try:
+        resp = httpx.patch(
+            f"{SUPABASE_URL}/rest/v1/model_prediction_logs",
+            headers={**HEADERS, "Prefer": "return=representation"},
+            params={
+                "ticket_date": f"eq.{ticket_date.isoformat()}",
+                "fixture_id": f"eq.{fixture_id}",
+                "market": f"eq.{market}",
+                "closing_bookmaker_odds": "is.null",
+            },
+            json={"closing_bookmaker_odds": round(float(closing_odds), 2)},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return len(resp.json() or [])
+    except Exception as e:
+        logger.error(
+            f"[SUPABASE] Failed to set closing price for fixture {fixture_id} "
+            f"market {market}: {e}"
+        )
+        return 0

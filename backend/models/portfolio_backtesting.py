@@ -390,8 +390,8 @@ def walk_forward_portfolio_backtest(
         skipped += len(day_matches) - len(analyzed)
         fixtures = {str(_fixture_id(match)): match for match in day_matches}
 
-        portfolio = run_portfolio(analyzed)
-        shadow = run_conservative_shadow(portfolio.get("candidate_evaluations") or [])
+        portfolio = run_portfolio(analyzed, reference_time=cutoff)
+        shadow = run_conservative_shadow(portfolio.get("candidate_evaluations") or [], reference_time=cutoff)
         consensus = _consensus_selections(analyzed)
         strategies = {
             "production": portfolio.get("selections") or [],

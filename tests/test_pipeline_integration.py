@@ -39,7 +39,7 @@ def test_full_pipeline_can_store_a_valid_single(monkeypatch):
         "away_team_id": 20,
         "competition_code": "PL",
         "league": "Premier League",
-        "kickoff_utc": "2026-11-05T15:00:00Z",
+        "kickoff_utc": "2099-11-05T15:00:00Z",
         "data_completeness": 1.0,
         "odds_snapshot": {"home_win": 2.0, "draw": 4.0, "away_win": 5.0},
         "recent_form": {"home": {}, "away": {}},
@@ -74,7 +74,7 @@ def test_shadow_failure_does_not_block_official_pipeline(monkeypatch):
     match = {
         "fixture_id": 999, "home_team": "Home", "away_team": "Away",
         "home_team_id": 10, "away_team_id": 20, "competition_code": "PL",
-        "league": "Premier League", "kickoff_utc": "2026-11-05T15:00:00Z",
+        "league": "Premier League", "kickoff_utc": "2099-11-05T15:00:00Z",
         "data_completeness": 1.0,
         "odds_snapshot": {"home_win": 2.0, "draw": 4.0, "away_win": 5.0},
         "recent_form": {"home": {}, "away": {}},
@@ -103,6 +103,7 @@ def test_llm_portfolio_excludes_private_candidate_evaluations():
     portfolio = agents.run_portfolio([{
         "fixture_id": 1, "home_team": "H", "away_team": "A", "league": "L",
         "markets": {"home_win": 0.7}, "odds_snapshot": {"home_win": 1.6},
+        "kickoff_utc": "2099-11-09T12:00:00Z",
         "model_version": "dixon_coles_v1", "feature_snapshot": {"training_matches": 100},
     }])
     compact = agents._portfolio_for_llm(portfolio)

@@ -7,6 +7,7 @@ def test_portfolio_uses_guarded_calibrated_probability_and_keeps_raw_value():
     match = {
         "fixture_id": 1, "home_team": "H", "away_team": "A", "league": "L",
         "markets": {"home_win": 0.60}, "odds_snapshot": {"home_win": 1.80},
+        "kickoff_utc": "2099-11-09T12:00:00Z",
         "model_version": "dixon_coles_v1",
         "probability_calibration": {
             "active": True, "version": "guarded_platt_v1", "intercept": 1.0, "slope": 1.0,
